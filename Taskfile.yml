@@ -1,0 +1,39 @@
+version: "3"
+
+vars:
+  # local.yaml boota de verdade (1 upstream stdio "everything").
+  # example.yaml é só referência de schema (tem um upstream http inexistente).
+  CONFIG: configs/mcpgate.local.yaml
+
+tasks:
+  dev:
+    desc: Hot reload com air
+    cmds:
+      - air
+
+  run:
+    desc: Sobe o gateway com a config local
+    cmds:
+      - go run ./cmd/mcpgate serve --config {{.CONFIG}}
+
+  test:
+    desc: Testes com race detector e cobertura
+    cmds:
+      - go test ./... -race -cover
+
+  lint:
+    desc: Lint com golangci-lint
+    cmds:
+      - golangci-lint run
+
+  build:
+    desc: Compila o binário único em bin/mcpgate
+    cmds:
+      - go build -ldflags='-s -w' -o bin/mcpgate ./cmd/mcpgate
+
+  inspect:
+    desc: Abre o MCP Inspector apontando pro gateway
+    # O Inspector tem um --config próprio; passamos o nosso via env MCPGATE_CONFIG
+    # com o -e dele, senão ele rouba a flag e tenta parsear o YAML como JSON.
+    cmds:
+      - npx @modelcontextprotocol/inspector -e MCPGATE_CONFIG={{.CONFIG}} go run ./cmd/mcpgate serve

@@ -1,0 +1,34 @@
+# Configuração de exemplo do mcpgate (MVP-0).
+#
+# Overrides via ambiente: qualquer chave pode ser sobrescrita com o prefixo
+# MCPGATE_ e "_" no lugar de ".". Ex.: MCPGATE_AUDIT_SINK=file.
+
+# Endereço do transporte HTTP voltado ao agente. RESERVADO: no MVP o serve é
+# stdio; este campo existe para quando o transporte HTTP chegar (estágio later).
+listen: ":8080"
+
+# Servidores MCP upstream que o gateway fronteia. O `name` é único e vira o
+# prefixo de namespace das tools (ex.: a tool `list_issues` do upstream `github`
+# é exposta ao agente como `github.list_issues`).
+upstreams:
+  # Exemplo stdio: o gateway sobe o processo e fala stdin/stdout com ele.
+  - name: everything
+    transport: stdio
+    command: ["npx", "-y", "@modelcontextprotocol/server-everything"]
+
+  # Exemplo http: o gateway fala o transporte streamable HTTP com o endpoint.
+  - name: postgres
+    transport: http
+    url: "http://localhost:9001/mcp"
+
+# Políticas de RBAC por ferramenta. PARSEADAS mas IGNORADAS no MVP — o motor de
+# política é o épico E2. O campo existe para o formato do arquivo nascer estável.
+policies: []
+  # - role: dev
+  #   allow_tools: ["everything.echo", "github.list_issues"]
+
+# Log de auditoria: uma linha JSONL por tools/call.
+audit:
+  sink: "stdout"     # "stdout" | "file"
+  format: "jsonl"
+  path: ""           # caminho do arquivo quando sink=file

@@ -1,0 +1,20 @@
+# Config local para testar o fluxo na mão (boota sem dependências externas além
+# do npx). Um único upstream stdio: o "everything" server de referência do MCP.
+#
+# A auditoria vai para um ARQUIVO de propósito: em transporte stdio o protocolo
+# JSON-RPC trafega pelo stdout, então mandar o log para stdout poluiria o canal.
+# Com sink=file, o stdout fica limpo (só respostas) e você acompanha a auditoria
+# com `tail -f mcpgate-audit.jsonl` em outro terminal.
+listen: ":8080"
+
+upstreams:
+  - name: everything
+    transport: stdio
+    command: ["npx", "-y", "@modelcontextprotocol/server-everything"]
+
+policies: []
+
+audit:
+  sink: "file"
+  format: "jsonl"
+  path: "mcpgate-audit.jsonl"

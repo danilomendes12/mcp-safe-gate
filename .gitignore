@@ -30,3 +30,7 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# artefatos locais de teste/leitura
+mcpgate-audit.jsonl
+mcpgate-explicacao.pdf
