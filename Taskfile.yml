@@ -32,8 +32,17 @@ tasks:
       - go build -ldflags='-s -w' -o bin/mcpgate ./cmd/mcpgate
 
   inspect:
-    desc: Abre o MCP Inspector apontando pro gateway
+    desc: Abre o MCP Inspector apontando pro gateway (transporte stdio; sobe o gateway como subprocesso)
     # O Inspector tem um --config próprio; passamos o nosso via env MCPGATE_CONFIG
     # com o -e dele, senão ele rouba a flag e tenta parsear o YAML como JSON.
+    # --transport stdio é explícito: o default do serve é http e o modo subprocesso
+    # do Inspector fala stdio com o processo que ele sobe.
     cmds:
-      - npx @modelcontextprotocol/inspector -e MCPGATE_CONFIG={{.CONFIG}} go run ./cmd/mcpgate serve
+      - npx @modelcontextprotocol/inspector -e MCPGATE_CONFIG={{.CONFIG}} go run ./cmd/mcpgate serve --transport stdio
+
+  inspect-http:
+    desc: Abre o MCP Inspector (UI) para conectar ao gateway HTTP; rode `task run` antes em outro terminal
+    # Sobe só a UI do Inspector; nela escolha "Streamable HTTP" e aponte para o
+    # endpoint do `listen` da config (ex.: http://localhost:8080).
+    cmds:
+      - npx @modelcontextprotocol/inspector

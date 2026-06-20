@@ -3,16 +3,36 @@
 #
 # A auditoria vai para um ARQUIVO de propósito: em transporte stdio o protocolo
 # JSON-RPC trafega pelo stdout, então mandar o log para stdout poluiria o canal.
-# Com sink=file, o stdout fica limpo (só respostas) e você acompanha a auditoria
-# com `tail -f mcpgate-audit.jsonl` em outro terminal.
+# Com sink=file, o stdout fica limpo e você acompanha a auditoria com
+# `tail -f mcpgate-audit.jsonl` em outro terminal (vale para http também).
 listen: ":8080"
+
+# Principal provisório que o resolver de identidade devolve (E2 não tem auth
+# real; o E4 troca o resolver). A política abaixo pode referenciar este agente.
+default_agent: "anonymous"
 
 upstreams:
   - name: everything
     transport: stdio
     command: ["npx", "-y", "@modelcontextprotocol/server-everything"]
 
-policies: []
+# RBAC por ferramenta (estágio 2). Postura default-deny: o que não casa nenhuma
+# lista é negado. deny tem precedência sobre allow. Nomes são NAMESPACED.
+policy:
+  default: deny
+  allow_tools:
+    - everything.echo          # chamada PERMITIDA no smoke test
+  deny_tools:
+    - everything.add           # chamada NEGADA (deny explícito) no smoke test
+  # everything.printEnv (e qualquer outra) cai no default-deny.
+
+# Quota de admissão por agente (token bucket in-process). A admissão roda ANTES
+# do RBAC, então toda tentativa de tools/call consome um token (mesmo as negadas).
+# burst folgado para o smoke demonstrar allow/deny/default-deny sem esbarrar no
+# limite; o passo de rate limit estoura disparando muitas chamadas de uma vez.
+rate_limit:
+  rps: 5
+  burst: 20
 
 audit:
   sink: "file"

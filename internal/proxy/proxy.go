@@ -11,7 +11,13 @@
 //  3. registra cada tool no mcp.Server com nome namespaced (<upstream>.<tool>) e
 //     o InputSchema copiado verbatim;
 //  4. o handler de forward chama o upstream com o nome ORIGINAL e audita;
-//  5. sobe o servidor em stdio.
+//  5. sobe o servidor no transporte norte escolhido (http por default, ou stdio).
+//
+// Importante sobre o ciclo de vida das conexões: as sessões dos upstreams (leg
+// sul) são abertas UMA vez, no boot (passos 1–2), e ficam ABERTAS por toda a
+// vida do processo. Cada tools/call do agente reaproveita a sessão já aberta —
+// não há reconexão por chamada. O transporte norte (leg norte, http/stdio) é
+// independente disso: o mesmo *mcp.Server serve qualquer transporte.
 package proxy
 
 import (
@@ -19,14 +25,35 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"os/exec"
+	"strings"
 	"time"
 
+	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/danilomendes/mcpgate/internal/audit"
+	"github.com/danilomendes/mcpgate/internal/auth"
 	"github.com/danilomendes/mcpgate/internal/config"
+	"github.com/danilomendes/mcpgate/internal/policy"
 )
+
+// Códigos JSON-RPC do range reservado a erros de servidor (-32000..-32099).
+// O agente recebe uma resposta de erro bem-formada — nunca panic nem queda de
+// conexão.
+const (
+	codePolicyDenied = -32001 // acesso negado pelo RBAC (estágio 2)
+	codeRateLimited  = -32002 // admissão negada por quota (SAFE-MCP/Impact, ATK-TA0040)
+)
+
+// methodCallTool é o método JSON-RPC interceptado pelos middlewares de admissão
+// e RBAC. Demais métodos (initialize, tools/list, ping) passam direto.
+const methodCallTool = "tools/call"
+
+// httpShutdownTimeout limita o tempo de drenagem do servidor HTTP no shutdown
+// gracioso (ctx cancelado por SIGINT/SIGTERM).
+const httpShutdownTimeout = 5 * time.Second
 
 const version = "0.1.0"
 
@@ -35,12 +62,17 @@ const version = "0.1.0"
 const namespaceSep = "."
 
 // Proxy mantém o estado do gateway em execução: o servidor voltado ao agente,
-// as sessões dos upstreams e o logger de auditoria.
+// as sessões dos upstreams, o logger de auditoria e o pipeline de governança
+// (resolver de identidade, rate limit e motor de política).
 type Proxy struct {
 	cfg      *config.Config
 	auditLog *audit.Logger
 	server   *mcp.Server
 	sessions []*mcp.ClientSession // mantidas para fechar no shutdown
+
+	resolver auth.Resolver
+	limiter  *perAgentLimiter
+	engine   *policy.Engine
 }
 
 // New conecta a todos os upstreams, descobre e registra suas tools, e devolve
@@ -53,17 +85,21 @@ func New(ctx context.Context, cfg *config.Config, auditLog *audit.Logger) (*Prox
 		cfg:      cfg,
 		auditLog: auditLog,
 		server:   mcp.NewServer(&mcp.Implementation{Name: "mcpgate", Version: version}, nil),
+		resolver: auth.NewStaticResolver(cfg.DefaultAgent),
+		limiter:  newPerAgentLimiter(cfg.RateLimit),
+		engine:   policy.NewEngine(cfg.Policy),
 	}
 
-	// Seam de extensão: os próximos estágios entram como receiving middleware
-	// aqui — E2 (RBAC), E4 (identidade) e E5 (inspeção/guardrails). No MVP é só
-	// um passthrough leve, deixado plugado e documentado de propósito.
-	p.server.AddReceivingMiddleware(tracingMiddleware)
-
-	if len(cfg.Policies) > 0 {
-		auditLog.Slog().Warn("política configurada mas ignorada: o motor de política ainda não existe (E2)",
-			"policies", len(cfg.Policies))
-	}
+	// Pipeline de governança (estágio 2). AddReceivingMiddleware(m1,m2,m3) executa
+	// m1 mais externo, então a ordem aqui É a ordem de execução:
+	//   resolver (identidade) -> rate limit (admissão) -> RBAC -> forward -> auditoria.
+	// A auditoria é o último elo: allow é auditado no forwardHandler; deny é
+	// auditado no próprio middleware que barrou (1 linha por tools/call, sempre).
+	p.server.AddReceivingMiddleware(
+		p.resolveMiddleware,
+		p.rateLimitMiddleware,
+		p.policyMiddleware,
+	)
 
 	for _, up := range cfg.Upstreams {
 		if err := p.connectUpstream(ctx, up); err != nil {
@@ -123,11 +159,14 @@ func (p *Proxy) registerTool(upstream string, session *mcp.ClientSession, src *m
 func (p *Proxy) forwardHandler(upstream, namespacedName, originalName string, session *mcp.ClientSession) mcp.ToolHandler {
 	return func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		start := time.Now()
+		// Chegou aqui => passou pelo rate limit e pelo RBAC: decisão = allow.
+		// O principal foi resolvido e posto no context pelo resolveMiddleware.
 		rec := audit.Record{
 			RequestID: audit.NewRequestID(),
 			Upstream:  upstream,
 			Tool:      namespacedName,
-			Identity:  audit.IdentityAnonymous,
+			Identity:  auth.PrincipalFromContext(ctx),
+			Decision:  audit.DecisionAllow,
 			ArgKeys:   argKeys(req.Params.Arguments),
 		}
 
@@ -155,10 +194,54 @@ func (p *Proxy) forwardHandler(upstream, namespacedName, originalName string, se
 	}
 }
 
-// Run sobe o servidor do gateway em stdio. Bloqueia até a desconexão do agente
-// ou o cancelamento do contexto.
-func (p *Proxy) Run(ctx context.Context) error {
+// Server expõe o *mcp.Server construído no boot. É o ponto único que o
+// callback getServer do StreamableHTTPHandler consome (mesma instância para
+// todo request) e que o transporte stdio roda — a lógica do server não é
+// duplicada por transporte.
+func (p *Proxy) Server() *mcp.Server { return p.server }
+
+// RunStdio sobe o servidor do gateway no transporte stdio. Bloqueia até a
+// desconexão do agente ou o cancelamento do contexto. Útil em cenário
+// laptop/single-user; o leg sul (upstreams) é indiferente a esta escolha.
+func (p *Proxy) RunStdio(ctx context.Context) error {
+	p.auditLog.Slog().Info("gateway ouvindo", "transport", "stdio")
 	return p.server.Run(ctx, &mcp.StdioTransport{})
+}
+
+// RunHTTP sobe o servidor do gateway no transporte Streamable HTTP, servido por
+// net/http em addr. Bloqueia até o cancelamento do contexto (SIGINT/SIGTERM),
+// quando drena as conexões com shutdown gracioso.
+//
+// Usa os defaults do SDK: sem EventStore, sem modo stateless, sem sessões
+// persistentes (E4/E10/E11). O mesmo *mcp.Server é devolvido a cada request —
+// as sessões dos upstreams, abertas no boot, são compartilhadas por todos.
+func (p *Proxy) RunHTTP(ctx context.Context, addr string) error {
+	handler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server {
+		return p.server
+	}, nil)
+
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second, // mitiga slowloris (Slowloris/DoS)
+	}
+
+	// Shutdown gracioso: quando o ctx é cancelado, drena as conexões em vez de
+	// derrubá-las no meio. ListenAndServe então retorna http.ErrServerClosed.
+	// context.Background() abaixo é proposital: o ctx de request já está cancelado
+	// (foi o que disparou o shutdown); a drenagem precisa do seu próprio prazo.
+	go func() { //nolint:gosec // G118: shutdown context deve ser independente do ctx já cancelado
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), httpShutdownTimeout)
+		defer cancel()
+		_ = srv.Shutdown(shutdownCtx)
+	}()
+
+	p.auditLog.Slog().Info("gateway ouvindo", "transport", "http", "addr", addr)
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return err
+	}
+	return nil
 }
 
 // Close fecha todas as sessões dos upstreams (encerrando os processos stdio).
@@ -203,11 +286,85 @@ func argKeys(raw json.RawMessage) []string {
 	return keys
 }
 
-// tracingMiddleware é o no-op (tracing leve) que ocupa o seam de extensão.
-// Os estágios E2/E4/E5 substituirão/encadearão middlewares aqui. Mantido como
-// MethodHandler passthrough para deixar o ponto de injeção plugado.
-func tracingMiddleware(next mcp.MethodHandler) mcp.MethodHandler {
+// resolveMiddleware resolve o principal (identidade) e o injeta no context, para
+// que os estágios seguintes o leiam de lá. No E2 o resolver é estático; o E4 só
+// troca o resolver. Aplica-se a todos os métodos.
+func (p *Proxy) resolveMiddleware(next mcp.MethodHandler) mcp.MethodHandler {
 	return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
+		ctx = auth.WithPrincipal(ctx, p.resolver.Resolve(ctx))
 		return next(ctx, method, req)
 	}
+}
+
+// rateLimitMiddleware é a admissão por agente (token bucket). Estoura => erro
+// JSON-RPC limpo (codeRateLimited); a conexão segue viva. Só age em tools/call.
+func (p *Proxy) rateLimitMiddleware(next mcp.MethodHandler) mcp.MethodHandler {
+	return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
+		if method != methodCallTool || !p.limiter.enabled() {
+			return next(ctx, method, req)
+		}
+		principal := auth.PrincipalFromContext(ctx)
+		if !p.limiter.allow(principal) {
+			tool := callToolName(req)
+			p.auditDeny(principal, tool, "rate_limited")
+			return nil, &jsonrpc.Error{
+				Code:    codeRateLimited,
+				Message: fmt.Sprintf("rate limit excedido para o agente %q", principal),
+			}
+		}
+		return next(ctx, method, req)
+	}
+}
+
+// policyMiddleware é o RBAC por ferramenta (default-deny). Nega => erro JSON-RPC
+// limpo (codePolicyDenied), sem repassar ao upstream. Só age em tools/call; a
+// tool negada continua visível no tools/list (filtrar é E3).
+func (p *Proxy) policyMiddleware(next mcp.MethodHandler) mcp.MethodHandler {
+	return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
+		if method != methodCallTool {
+			return next(ctx, method, req)
+		}
+		principal := auth.PrincipalFromContext(ctx)
+		tool := callToolName(req)
+		if d := p.engine.Evaluate(principal, tool); !d.Allow {
+			p.auditDeny(principal, tool, d.Reason)
+			return nil, &jsonrpc.Error{
+				Code:    codePolicyDenied,
+				Message: fmt.Sprintf("acesso negado à tool %q para o agente %q (%s)", tool, principal, d.Reason),
+			}
+		}
+		return next(ctx, method, req)
+	}
+}
+
+// auditDeny emite a linha de auditoria de uma chamada barrada (rate limit ou
+// RBAC), com decision=deny e o principal. É o único ponto de auditoria do
+// caminho negado — o caminho allow é auditado no forwardHandler.
+func (p *Proxy) auditDeny(principal, tool, reason string) {
+	p.auditLog.Emit(audit.Record{
+		RequestID: audit.NewRequestID(),
+		Upstream:  upstreamOf(tool),
+		Tool:      tool,
+		Identity:  principal,
+		Decision:  audit.DecisionDeny,
+		OK:        false,
+		Error:     reason,
+	})
+}
+
+// callToolName extrai o nome (namespaced) da tool de uma requisição tools/call.
+func callToolName(req mcp.Request) string {
+	if params, ok := req.GetParams().(*mcp.CallToolParamsRaw); ok {
+		return params.Name
+	}
+	return ""
+}
+
+// upstreamOf deriva o nome do upstream do nome namespaced da tool (prefixo antes
+// do primeiro separador). Vazio se não houver prefixo.
+func upstreamOf(tool string) string {
+	if i := strings.Index(tool, namespaceSep); i >= 0 {
+		return tool[:i]
+	}
+	return ""
 }

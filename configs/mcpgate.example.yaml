@@ -1,11 +1,14 @@
-# Configuração de exemplo do mcpgate (MVP-0).
+# Configuração de exemplo do mcpgate — referência do schema.
 #
 # Overrides via ambiente: qualquer chave pode ser sobrescrita com o prefixo
 # MCPGATE_ e "_" no lugar de ".". Ex.: MCPGATE_AUDIT_SINK=file.
 
-# Endereço do transporte HTTP voltado ao agente. RESERVADO: no MVP o serve é
-# stdio; este campo existe para quando o transporte HTTP chegar (estágio later).
+# Endereço do transporte HTTP voltado ao agente (serve --transport http).
 listen: ":8080"
+
+# Principal provisório devolvido pelo resolver de identidade enquanto não há
+# autenticação real (estágio E4 troca o resolver). Vazio => "anonymous".
+default_agent: "anonymous"
 
 # Servidores MCP upstream que o gateway fronteia. O `name` é único e vira o
 # prefixo de namespace das tools (ex.: a tool `list_issues` do upstream `github`
@@ -21,13 +24,34 @@ upstreams:
     transport: http
     url: "http://localhost:9001/mcp"
 
-# Políticas de RBAC por ferramenta. PARSEADAS mas IGNORADAS no MVP — o motor de
-# política é o épico E2. O campo existe para o formato do arquivo nascer estável.
-policies: []
-  # - role: dev
-  #   allow_tools: ["everything.echo", "github.list_issues"]
+# RBAC por ferramenta (estágio 2). Postura default-deny: o que não casa nenhuma
+# lista é negado no tools/call. deny tem precedência sobre allow. A tool negada
+# CONTINUA visível no tools/list (filtrar a descoberta é o épico E3). Nomes são
+# NAMESPACED (<upstream>.<tool>).
+policy:
+  default: deny
+  allow_tools:
+    - everything.echo
+    - postgres.query
+  deny_tools:
+    - postgres.drop_table
 
-# Log de auditoria: uma linha JSONL por tools/call.
+  # Opcional: regras por principal. Se o principal tiver entrada aqui, ela
+  # substitui as listas globais acima; senão valem as globais.
+  agents:
+    ci-bot:
+      default: deny
+      allow_tools:
+        - everything.echo
+
+# Quota de admissão por agente: token bucket in-process, puro-Go (sem store
+# externo). Defesa contra DoS por exaustão de recursos (SAFE-MCP / Impact).
+# rps<=0 desliga o rate limiting; com rps>0 o burst precisa ser >=1.
+rate_limit:
+  rps: 10
+  burst: 20
+
+# Log de auditoria: uma linha JSONL por tools/call, com `decision` e `identity`.
 audit:
   sink: "stdout"     # "stdout" | "file"
   format: "jsonl"

@@ -37,6 +37,13 @@ func TestValidateErrors(t *testing.T) {
 		{"transport inválido", func(c *Config) { c.Upstreams[0].Transport = "grpc" }, "inválido"},
 		{"sink inválido", func(c *Config) { c.Audit.Sink = "syslog" }, "audit.sink"},
 		{"file sem path", func(c *Config) { c.Audit.Sink = SinkFile; c.Audit.Path = "" }, "audit.path"},
+		{"policy.default inválido", func(c *Config) { c.Policy.Default = "maybe" }, "policy.default"},
+		{"agent.default inválido", func(c *Config) {
+			c.Policy.Agents = map[string]AgentPolicy{"bot": {Default: "perhaps"}}
+		}, "policy.agents"},
+		{"rps negativo", func(c *Config) { c.RateLimit.RPS = -1 }, "rate_limit.rps"},
+		{"burst negativo", func(c *Config) { c.RateLimit.Burst = -1 }, "rate_limit.burst"},
+		{"burst zero com rps", func(c *Config) { c.RateLimit.RPS = 5; c.RateLimit.Burst = 0 }, "rate_limit.burst"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

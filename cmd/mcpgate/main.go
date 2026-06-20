@@ -1,7 +1,8 @@
 // Command mcpgate é o gateway de governança para MCP.
 //
-// No MVP-0 expõe dois subcomandos: `serve` (sobe o proxy em stdio) e
-// `validate-config` (valida o arquivo estaticamente, sem rede).
+// Expõe dois subcomandos: `serve` (sobe o proxy; transporte norte http por
+// default, ou stdio via --transport) e `validate-config` (valida o arquivo
+// estaticamente, sem rede).
 package main
 
 import (
@@ -46,16 +47,24 @@ func defaultConfigPath() string {
 	return "configs/mcpgate.example.yaml"
 }
 
+// Transportes norte suportados pelo `serve` (voltados ao agente).
+const (
+	transportHTTP  = "http"
+	transportStdio = "stdio"
+)
+
 func newServeCmd() *cobra.Command {
 	var configPath string
+	var transport string
 	cmd := &cobra.Command{
 		Use:   "serve",
-		Short: "Sobe o gateway (transporte stdio) e fronteia os upstreams configurados",
+		Short: "Sobe o gateway e fronteia os upstreams configurados",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return runServe(cmd.Context(), configPath)
+			return runServe(cmd.Context(), configPath, transport)
 		},
 	}
 	cmd.Flags().StringVar(&configPath, "config", defaultConfigPath(), "caminho do arquivo de configuração (ou via env MCPGATE_CONFIG)")
+	cmd.Flags().StringVar(&transport, "transport", transportHTTP, "transporte norte voltado ao agente (http|stdio)")
 	return cmd
 }
 
@@ -76,7 +85,11 @@ func newValidateConfigCmd() *cobra.Command {
 	return cmd
 }
 
-func runServe(ctx context.Context, configPath string) error {
+func runServe(ctx context.Context, configPath, transport string) error {
+	if transport != transportHTTP && transport != transportStdio {
+		return fmt.Errorf("--transport %q inválido (use http|stdio)", transport)
+	}
+
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		return err
@@ -89,7 +102,7 @@ func runServe(ctx context.Context, configPath string) error {
 	defer func() { _ = auditLog.Close() }()
 
 	// Encerramento gracioso em SIGINT/SIGTERM: cancela o ctx, o que faz o
-	// server.Run retornar e dispara o fechamento das sessões dos upstreams.
+	// serving retornar e dispara o fechamento das sessões dos upstreams.
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -99,7 +112,13 @@ func runServe(ctx context.Context, configPath string) error {
 	}
 	defer func() { _ = p.Close() }()
 
-	if err := p.Run(ctx); err != nil && ctx.Err() == nil {
+	switch transport {
+	case transportStdio:
+		err = p.RunStdio(ctx)
+	default: // transportHTTP
+		err = p.RunHTTP(ctx, cfg.Listen)
+	}
+	if err != nil && ctx.Err() == nil {
 		return fmt.Errorf("servidor: %w", err)
 	}
 	return nil

@@ -32,18 +32,25 @@ type Logger struct {
 // (ArgKeys) — para não vazar PII no log no MVP (a redação fica no estágio E5).
 type Record struct {
 	RequestID  string   // id curto, único por chamada
-	Upstream   string   // nome do upstream que atendeu a chamada
+	Upstream   string   // nome do upstream que atendeu (ou seria roteado) a chamada
 	Tool       string   // nome namespaced da tool (ex.: github.list_issues)
-	Identity   string   // identidade do humano por trás do agente ("anonymous" no MVP)
+	Identity   string   // principal por trás do agente (resolvido no estágio de auth)
+	Decision   string   // decisão de política: "allow" | "deny"
 	ArgKeys    []string // apenas as chaves dos argumentos, nunca os valores
-	DurationMS int64    // latência da chamada ao upstream
+	DurationMS int64    // latência da chamada ao upstream (0 quando negada antes do forward)
 	OK         bool     // true se a chamada teve sucesso a nível de transporte
-	Error      string   // mensagem de erro (vazio se OK)
+	Error      string   // mensagem de erro / motivo do deny (vazio se OK e allow)
 }
 
-// IdentityAnonymous é a identidade usada enquanto o estágio de auth (E4) não
-// existe. Mantida como constante para o dia em que houver identidade real.
+// IdentityAnonymous é o principal usado enquanto o estágio de auth (E4) não
+// resolve identidade real. Mantida como constante para o dia em que houver.
 const IdentityAnonymous = "anonymous"
+
+// Decisões de política registradas no campo `decision` da auditoria.
+const (
+	DecisionAllow = "allow"
+	DecisionDeny  = "deny"
+)
 
 // New constrói um Logger a partir da config de auditoria. Quando o sink é um
 // arquivo, o caller deve chamar Close para liberar o descritor.
@@ -93,6 +100,7 @@ func (l *Logger) Emit(r Record) {
 		slog.String("upstream", r.Upstream),
 		slog.String("tool", r.Tool),
 		slog.String("identity", r.Identity),
+		slog.String("decision", r.Decision),
 		slog.Any("arg_keys", r.ArgKeys),
 		slog.Int64("duration_ms", r.DurationMS),
 		slog.Bool("ok", r.OK),
