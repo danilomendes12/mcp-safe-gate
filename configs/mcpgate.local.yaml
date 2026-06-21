@@ -26,6 +26,20 @@ policy:
     - everything.add           # chamada NEGADA (deny explícito) no smoke test
   # everything.printEnv (e qualquer outra) cai no default-deny.
 
+  # Perfil explícito do principal `anonymous` (o default_agent do caminho stdio).
+  # Se um principal tem entrada em `agents`, ELA substitui as listas globais acima.
+  # Aqui ele espelha a política global de propósito, para o smoke test stdio valer
+  # tanto pela regra global quanto pela explícita (echo visível/permitida; add e
+  # printEnv invisíveis/negadas no E3). Para explorar TODAS as tools no Inspector
+  # stdio, troque o corpo por `default: allow` (libera tudo para o anonymous).
+  agents:
+    anonymous:
+      default: deny
+      allow_tools:
+        - everything.echo
+      deny_tools:
+        - everything.add
+
 # Quota de admissão por agente (token bucket in-process). A admissão roda ANTES
 # do RBAC, então toda tentativa de tools/call consome um token (mesmo as negadas).
 # burst folgado para o smoke demonstrar allow/deny/default-deny sem esbarrar no

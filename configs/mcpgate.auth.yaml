@@ -1,0 +1,55 @@
+# Config para testar a AUTENTICAÇÃO norte (E4) na mão, sobre HTTP, sem mocks
+# externos: o único upstream é o "everything" (via npx), e a auth é por API key
+# estática — basta um `Authorization: Bearer <key>` no cliente (cURL/Inspector).
+#
+# Boot:  ./bin/mcpgate serve --config configs/mcpgate.auth.yaml   (transport http é o default)
+# Smoke: ver a seção "Auth norte (E4)" no README.
+listen: ":8080"
+
+# Sem token => o principal NÃO cai aqui; o middleware rejeita com 401 antes. Este
+# default só vale no caminho stdio (que ignora `auth`).
+default_agent: "anonymous"
+
+upstreams:
+  - name: everything
+    transport: stdio
+    command: ["npx", "-y", "@modelcontextprotocol/server-everything"]
+
+# Autenticação do cliente no transporte norte. mode=apikey: cada key vira um
+# principal. As duas keys abaixo provam os três caminhos do smoke:
+#   - alice-key  -> principal "alice", tem o scope exigido  => 200, vê echo
+#   - bob-key    -> principal "bob",   SEM o scope exigido   => 403
+#   - (sem key)                                              => 401 + WWW-Authenticate
+auth:
+  mode: apikey
+  required_scopes: ["tools:call"]
+  api_keys:
+    - key: "alice-key"
+      principal: "alice"
+      scopes: ["tools:call"]
+    - key: "bob-key"
+      principal: "bob"
+      scopes: []
+
+# A política é por principal (resolvido do token). alice só enxerga/chama echo;
+# qualquer outra tool fica invisível no tools/list (E3) e é negada no tools/call.
+policy:
+  default: deny
+  agents:
+    alice:
+      default: deny
+      allow_tools:
+        - everything.echo
+    bob:
+      default: deny
+      allow_tools:
+        - everything.echo
+
+rate_limit:
+  rps: 5
+  burst: 20
+
+audit:
+  sink: "file"
+  format: "jsonl"
+  path: "mcpgate-audit.jsonl"

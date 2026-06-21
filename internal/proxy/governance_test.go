@@ -47,12 +47,17 @@ func newMultiToolUpstream(ctx context.Context, t *testing.T) *mcp.ClientSession 
 	return sess
 }
 
-// buildGateway monta um Proxy com o pipeline de governança plugado (igual a New,
-// mas com um upstream em memória já conectado) e devolve uma sessão de agente.
-func buildGateway(ctx context.Context, t *testing.T, cfg *config.Config, auditLog *audit.Logger) *mcp.ClientSession {
+// buildProxy monta um *Proxy com o pipeline de governança completo (igual a New:
+// resolver+verifier de auth, descoberta filtrada, rate limit, RBAC) e um upstream
+// "everything" em memória já conectado e registrado.
+func buildProxy(ctx context.Context, t *testing.T, cfg *config.Config, auditLog *audit.Logger) *Proxy {
 	t.Helper()
 	up := newMultiToolUpstream(ctx, t)
 
+	verifier, authOpts, err := auth.NewVerifier(cfg.Auth)
+	if err != nil {
+		t.Fatalf("auth verifier: %v", err)
+	}
 	p := &Proxy{
 		cfg:      cfg,
 		auditLog: auditLog,
@@ -60,8 +65,10 @@ func buildGateway(ctx context.Context, t *testing.T, cfg *config.Config, auditLo
 		resolver: auth.NewStaticResolver(cfg.DefaultAgent),
 		limiter:  newPerAgentLimiter(cfg.RateLimit),
 		engine:   policy.NewEngine(cfg.Policy),
+		verifier: verifier,
+		authOpts: authOpts,
 	}
-	p.server.AddReceivingMiddleware(p.resolveMiddleware, p.rateLimitMiddleware, p.policyMiddleware)
+	p.server.AddReceivingMiddleware(p.resolveMiddleware, p.discoveryMiddleware, p.rateLimitMiddleware, p.policyMiddleware)
 
 	list, err := up.ListTools(ctx, nil)
 	if err != nil {
@@ -70,6 +77,13 @@ func buildGateway(ctx context.Context, t *testing.T, cfg *config.Config, auditLo
 	for _, tool := range list.Tools {
 		p.registerTool("everything", up, tool)
 	}
+	return p
+}
+
+// buildGateway devolve uma sessão de agente conectada em memória ao Proxy.
+func buildGateway(ctx context.Context, t *testing.T, cfg *config.Config, auditLog *audit.Logger) *mcp.ClientSession {
+	t.Helper()
+	p := buildProxy(ctx, t, cfg, auditLog)
 
 	gSrvT, gCliT := mcp.NewInMemoryTransports()
 	if _, err := p.server.Connect(ctx, gSrvT, nil); err != nil {
@@ -104,13 +118,17 @@ func TestPolicyDecisionsAndAudit(t *testing.T) {
 
 	agent := buildGateway(ctx, t, smokePolicyConfig(), auditLog)
 
-	// tools/list expõe TODAS as tools, inclusive as negadas (filtrar é E3).
+	// tools/list é filtrado (E3): só a tool permitida (echo) aparece; a negada
+	// (add) e a default-deny (printEnv) ficam INVISÍVEIS — não só bloqueadas.
 	list, err := agent.ListTools(ctx, nil)
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
-	if got := len(list.Tools); got != 3 {
-		t.Fatalf("esperava 3 tools visíveis (incl. negadas), got %d", got)
+	if got := len(list.Tools); got != 1 {
+		t.Fatalf("esperava 1 tool visível (só a permitida), got %d", got)
+	}
+	if list.Tools[0].Name != "everything.echo" {
+		t.Fatalf("esperava só everything.echo visível, got %q", list.Tools[0].Name)
 	}
 
 	// 1) allow: echo retorna o resultado real do upstream.

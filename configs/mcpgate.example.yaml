@@ -23,6 +23,44 @@ upstreams:
   - name: postgres
     transport: http
     url: "http://localhost:9001/mcp"
+    # Auth sul (E4, opcional): bearer que o gateway usa para se autenticar NESTE
+    # upstream. O segredo fica só entre gateway e upstream — nunca chega ao
+    # agente. Use override de ambiente para não versionar o segredo, ex.:
+    # MCPGATE_UPSTREAMS_1_BEARER_TOKEN=...
+    bearer_token: ""
+
+# Autenticação do cliente no transporte norte (estágio 1 / E4). SÓ tem efeito no
+# caminho HTTP; em stdio a identidade é sempre "anonymous". O principal resolvido
+# aqui substitui o default_agent e alimenta o RBAC, a descoberta filtrada (E3) e
+# a auditoria. Mitiga confused deputy (SAFE-T1307): o gateway age pela identidade
+# verificada do humano por trás do agente.
+auth:
+  # "none" (default) = sem auth, principal cai no default_agent (compat E2).
+  # "apikey" = bearer é uma API key estática mapeada a um principal.
+  # "jwt"    = bearer é um JWT HS256 assinado com o segredo abaixo.
+  mode: "none"
+
+  # Scopes exigidos em TODA requisição autenticada (o middleware do SDK checa;
+  # faltando => 403 + WWW-Authenticate). Vazio => sem exigência de scope.
+  required_scopes: []
+
+  # Opcional: URL de protected resource metadata (RFC 9728) no WWW-Authenticate.
+  resource_metadata_url: ""
+
+  # mode=apikey: cada key estática vira um principal. Prefira injetar a key por
+  # ambiente (MCPGATE_AUTH_API_KEYS_0_KEY=...) a versioná-la.
+  api_keys:
+    - key: "troque-esta-chave"
+      principal: "ci-bot"
+      scopes: ["tools:call"]
+
+  # mode=jwt: verificação HS256 (segredo compartilhado). RS256/JWKS e OAuth
+  # completo ficam para fase posterior do E4.
+  jwt:
+    secret: ""            # obrigatório quando mode=jwt
+    principal_claim: "sub" # claim usada como principal (vazio => "sub")
+    issuer: ""            # se setado, validado contra a claim `iss`
+    audience: ""          # se setado, validado contra a claim `aud`
 
 # RBAC por ferramenta (estágio 2). Postura default-deny: o que não casa nenhuma
 # lista é negado no tools/call. deny tem precedência sobre allow. A tool negada

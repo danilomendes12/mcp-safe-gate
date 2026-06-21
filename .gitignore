@@ -8,6 +8,11 @@
 *.so
 *.dylib
 
+# Diretório de build do binário (task build / go build -o bin/...)
+/bin/
+
+/docs/
+
 # Test binary, built with `go test -c`
 *.test
 

@@ -44,6 +44,15 @@ func TestValidateErrors(t *testing.T) {
 		{"rps negativo", func(c *Config) { c.RateLimit.RPS = -1 }, "rate_limit.rps"},
 		{"burst negativo", func(c *Config) { c.RateLimit.Burst = -1 }, "rate_limit.burst"},
 		{"burst zero com rps", func(c *Config) { c.RateLimit.RPS = 5; c.RateLimit.Burst = 0 }, "rate_limit.burst"},
+		{"auth.mode inválido", func(c *Config) { c.Auth.Mode = "saml" }, "auth.mode"},
+		{"apikey sem keys", func(c *Config) { c.Auth.Mode = AuthAPIKey }, "auth.api_keys"},
+		{"apikey sem principal", func(c *Config) {
+			c.Auth = Auth{Mode: AuthAPIKey, APIKeys: []APIKey{{Key: "k"}}}
+		}, "principal"},
+		{"apikey key duplicada", func(c *Config) {
+			c.Auth = Auth{Mode: AuthAPIKey, APIKeys: []APIKey{{Key: "k", Principal: "a"}, {Key: "k", Principal: "b"}}}
+		}, "duplicado"},
+		{"jwt sem secret", func(c *Config) { c.Auth.Mode = AuthJWT }, "auth.jwt.secret"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -57,6 +66,22 @@ func TestValidateErrors(t *testing.T) {
 				t.Fatalf("erro %q não contém %q", err.Error(), tt.wantSub)
 			}
 		})
+	}
+}
+
+func TestValidateAuthModesOK(t *testing.T) {
+	cases := []func(*Config){
+		func(c *Config) { c.Auth = Auth{} },                  // vazio => none
+		func(c *Config) { c.Auth = Auth{Mode: AuthNone} },    // none explícito
+		func(c *Config) { c.Auth = Auth{Mode: AuthAPIKey, APIKeys: []APIKey{{Key: "k", Principal: "ci"}}} },
+		func(c *Config) { c.Auth = Auth{Mode: AuthJWT, JWT: JWT{Secret: "s"}} },
+	}
+	for i, mutate := range cases {
+		c := validCfg()
+		mutate(c)
+		if err := c.Validate(); err != nil {
+			t.Errorf("caso %d: auth válida deveria passar, got: %v", i, err)
+		}
 	}
 }
 

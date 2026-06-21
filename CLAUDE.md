@@ -46,6 +46,8 @@ Modele e priorize defesas pelo SAFE-MCP (framework MITRE ATT&CK para MCP). Mapei
 - SAFE-T1001 (Tool Poisoning) — validar definições de tools vindas dos upstreams
 - SAFE-T1102 (Prompt Injection) — inspeção de payload no estágio 4
 - SAFE-T1201 (Rug Pull) — detectar mudança de definição de tool entre sessões
+- SAFE-T1307 (Confused Deputy) — identidade verificada do bearer no estágio 1 (E4); o gateway age pelo principal real, não repassa cegamente
+- SAFE-T1602 (Tool Enumeration) — descoberta filtrada no estágio 3 (E3): a tool fora da política some do `tools/list`, não só é bloqueada
 
 ## Regras de trabalho
 

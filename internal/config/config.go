@@ -39,6 +39,14 @@ const (
 	PolicyAllow = "allow"
 )
 
+// Modos de autenticação do transporte norte (estágio 1 / E4). Só valem no
+// caminho HTTP; em stdio a identidade é sempre "anonymous".
+const (
+	AuthNone   = "none"   // sem autenticação: principal cai no default_agent (compat E2)
+	AuthAPIKey = "apikey" // bearer = API key estática mapeada a um principal
+	AuthJWT    = "jwt"    // bearer = JWT HS256 assinado com segredo compartilhado
+)
+
 // Config é a configuração completa do gateway.
 type Config struct {
 	// Listen é o endereço do transporte HTTP voltado ao agente (serve --transport http).
@@ -48,6 +56,9 @@ type Config struct {
 	DefaultAgent string `koanf:"default_agent"`
 	// Upstreams são os servidores MCP que o gateway fronteia.
 	Upstreams []Upstream `koanf:"upstreams"`
+	// Auth é a autenticação do cliente no transporte norte (estágio 1 / E4). Só
+	// tem efeito no caminho HTTP; stdio é sempre "anonymous". Vazio => sem auth.
+	Auth Auth `koanf:"auth"`
 	// Policy é o RBAC por ferramenta (estágio 2 / E2): default-deny + allow/deny.
 	Policy Policy `koanf:"policy"`
 	// RateLimit é a admissão por agente (token bucket in-process). RPS<=0 desliga.
@@ -66,6 +77,52 @@ type Upstream struct {
 	Command []string `koanf:"command"`
 	// URL é o endpoint MCP; obrigatório se transport=http.
 	URL string `koanf:"url"`
+	// BearerToken, se presente, é injetado como `Authorization: Bearer` em cada
+	// requisição ao upstream (leg sul, transport=http). É o segredo que o gateway
+	// usa para se autenticar no upstream — NUNCA é exposto ao agente. Aceita
+	// override por ambiente (ex.: MCPGATE_UPSTREAMS_0_BEARER_TOKEN).
+	BearerToken string `koanf:"bearer_token"`
+}
+
+// Auth descreve a autenticação do cliente MCP no transporte norte (estágio 1).
+// Mode seleciona o verificador do bearer token; RequiredScopes são os scopes
+// exigidos em TODA requisição (o middleware do SDK os checa — não duplicamos).
+type Auth struct {
+	// Mode é "none" (default), "apikey" ou "jwt".
+	Mode string `koanf:"mode"`
+	// RequiredScopes são exigidos em toda requisição autenticada. Faltando =>
+	// 403 + WWW-Authenticate.
+	RequiredScopes []string `koanf:"required_scopes"`
+	// ResourceMetadataURL é opcional: vai no header WWW-Authenticate para o fluxo
+	// de protected resource metadata (RFC 9728).
+	ResourceMetadataURL string `koanf:"resource_metadata_url"`
+	// APIKeys mapeia cada key estática a um principal (mode=apikey).
+	APIKeys []APIKey `koanf:"api_keys"`
+	// JWT configura a verificação de JWT HS256 (mode=jwt).
+	JWT JWT `koanf:"jwt"`
+}
+
+// APIKey associa uma API key estática a um principal e a scopes opcionais.
+type APIKey struct {
+	// Key é o valor do bearer token apresentado pelo cliente.
+	Key string `koanf:"key"`
+	// Principal é o "humano por trás do agente" resolvido a partir desta key.
+	Principal string `koanf:"principal"`
+	// Scopes concedidos a esta key (casados contra Auth.RequiredScopes).
+	Scopes []string `koanf:"scopes"`
+}
+
+// JWT configura a verificação de JWT assinado em HS256 (segredo compartilhado).
+// RS256/JWKS e OAuth completo ficam para fase posterior (E4), como o backlog prevê.
+type JWT struct {
+	// Secret é o segredo compartilhado HS256. Obrigatório quando mode=jwt.
+	Secret string `koanf:"secret"`
+	// PrincipalClaim é a claim usada como principal. Vazio => "sub".
+	PrincipalClaim string `koanf:"principal_claim"`
+	// Issuer, se setado, é validado contra a claim `iss`.
+	Issuer string `koanf:"issuer"`
+	// Audience, se setado, é validado contra a claim `aud`.
+	Audience string `koanf:"audience"`
 }
 
 // Policy é o RBAC por ferramenta. A avaliação é por tool NAMESPACED
@@ -191,10 +248,45 @@ func (c *Config) Validate() error {
 		errs = append(errs, fmt.Errorf("audit.sink: %q inválido (use stdout|file)", c.Audit.Sink))
 	}
 
+	errs = append(errs, c.Auth.validate()...)
 	errs = append(errs, c.Policy.validate()...)
 	errs = append(errs, c.RateLimit.validate()...)
 
 	return errors.Join(errs...)
+}
+
+// validate checa o bloco de auth. Mode vazio é válido (=> none, sem auth).
+func (a Auth) validate() []error {
+	var errs []error
+	switch a.Mode {
+	case "", AuthNone:
+		// Sem auth: api_keys/jwt são ignorados; nada a validar.
+	case AuthAPIKey:
+		if len(a.APIKeys) == 0 {
+			errs = append(errs, errors.New("auth.api_keys: ao menos uma é obrigatória para mode=apikey"))
+		}
+		seen := make(map[string]struct{}, len(a.APIKeys))
+		for i, k := range a.APIKeys {
+			who := fmt.Sprintf("auth.api_keys[%d]", i)
+			if strings.TrimSpace(k.Key) == "" {
+				errs = append(errs, fmt.Errorf("%s.key: obrigatório", who))
+			} else if _, dup := seen[k.Key]; dup {
+				errs = append(errs, fmt.Errorf("%s.key: duplicado", who))
+			} else {
+				seen[k.Key] = struct{}{}
+			}
+			if strings.TrimSpace(k.Principal) == "" {
+				errs = append(errs, fmt.Errorf("%s.principal: obrigatório", who))
+			}
+		}
+	case AuthJWT:
+		if strings.TrimSpace(a.JWT.Secret) == "" {
+			errs = append(errs, errors.New("auth.jwt.secret: obrigatório para mode=jwt (HS256)"))
+		}
+	default:
+		errs = append(errs, fmt.Errorf("auth.mode: %q inválido (use none|apikey|jwt)", a.Mode))
+	}
+	return errs
 }
 
 // validate checa o bloco de política. Default vazio é válido (=> deny).

@@ -1,14 +1,17 @@
 // Package auth é o estágio 1 do gateway: autentica o cliente MCP e resolve a
 // identidade do humano por trás do agente (o "principal").
 //
-// No E2 ainda NÃO há autenticação real. O que existe é o seam: um Resolver
-// provisório devolve um principal fixo (o default_agent da config, ou
-// "anonymous"), e o principal trafega pelo context.Context. Os estágios de
-// admissão e RBAC (rate limit e política) leem o principal do context, nunca
-// resolvem identidade eles mesmos.
+// Dois caminhos de resolução de principal, ambos terminando no context.Context
+// (de onde os estágios de admissão e RBAC o leem — eles nunca resolvem
+// identidade por conta própria):
 //
-// O E4 substitui APENAS o Resolver por um que extrai a identidade real
-// (OAuth/JWT/bearer) — sem tocar em quem consome o principal.
+//   - HTTP (E4): o bearer token é verificado pelo middleware RequireBearerToken
+//     do SDK usando o TokenVerifier de NewVerifier (apikey/JWT). O principal sai
+//     do TokenInfo resultante (ver PrincipalFromTokenInfo).
+//   - stdio (caso laptop/single-user): não há bearer; o StaticResolver devolve o
+//     default_agent da config (ou "anonymous"). Mesmo seam, sem auth.
+//
+// OAuth completo (oauthex, client-side) fica para fase posterior, como o E4 prevê.
 package auth
 
 import "context"

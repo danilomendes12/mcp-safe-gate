@@ -2,7 +2,7 @@
 
 > Gateway de governança open source para MCP, em Go, como binário único: um reverse proxy entre seus agentes de IA e os servidores MCP upstream, auditando cada chamada de ferramenta.
 
-Para os agentes, o mcpgate é um `mcp.Server`; para cada upstream, um `mcp.Client`. Toda chamada de ferramenta atravessa o gateway, que roteia e — nos próximos estágios — aplica identidade, política por ferramenta e guardrails de inspeção.
+Para os agentes, o mcpgate é um `mcp.Server`; para cada upstream, um `mcp.Client`. Toda chamada de ferramenta atravessa o gateway, que roteia, aplica **política por ferramenta** (RBAC default-deny) e **rate limit**, audita cada chamada — e, nos próximos estágios, vai resolver **identidade** real e aplicar **guardrails de inspeção**.
 
 ## MVP-0 — o que é
 
@@ -20,9 +20,22 @@ Este corte é a **demo de 5 minutos**: um **proxy passthrough verbatim** que fro
 - **Rate limit por agente** (token bucket in-process): admissão antes do RBAC; ao estourar, erro JSON-RPC limpo (`-32002`) sem derrubar a conexão. Mapeia a defesa contra DoS por exaustão de recursos (SAFE-MCP / Impact, ATK-TA0040).
 - **Auditoria** passa a registrar `decision` (allow/deny) e o `principal` (campo `identity`) em **toda** `tools/call`.
 
-## E2 — o que NÃO é (ainda)
+## E3 + E4 — o que entrou
 
-Filtrar `tools/list` para esconder a tool negada (E3 — no E2 ela **continua visível** e só é barrada no `tools/call`), identidade/OAuth real (E4 — o resolver devolve um principal provisório), inspeção/guardrails — prompt injection, PII, SAFE-MCP (E5), idempotência/circuit breaker/reconexão de upstream (E6/E9–E12), traces OpenTelemetry. Os pacotes desses estágios já existem como placeholders.
+- **Descoberta filtrada** (estágio 3 / E3): o `tools/list` agora é **filtrado pela política** — a tool que o principal não pode chamar fica **invisível** na listagem, não só bloqueada no `tools/call`. Mesmo `Engine` do RBAC, então o que some da lista é exatamente o que seria negado. Mitiga enumeração de tools / capability mapping (**SAFE-T1602**).
+- **Identidade + auth** (estágio 1 / E4), **só no caminho HTTP**: o handler é envolvido pelo `RequireBearerToken` do SDK. Dois modos config-driven:
+  - `apikey` — API key estática mapeada a um principal (`auth.api_keys`);
+  - `jwt` — JWT **HS256** (segredo compartilhado), com validação de assinatura, `exp`, scopes e (opcional) `iss`/`aud`. O principal sai da claim configurável (default `sub`).
+
+  O principal resolvido do token substitui o `default_agent` e alimenta RBAC, descoberta filtrada e auditoria. Sem token → **401 + `WWW-Authenticate`**; scope insuficiente → **403**. Mitiga confused deputy (**SAFE-T1307**): o gateway age pela identidade verificada do humano por trás do agente.
+- **Auth sul (upstream)**, opcional: `upstreams[].bearer_token` injeta `Authorization: Bearer` no leg sul (transport HTTP). O segredo fica só entre gateway e upstream — **nunca** chega ao agente.
+- **Caminho stdio inalterado**: sem auth, identidade `anonymous` — o self-host de 5 min segue igual.
+
+OAuth completo (`oauthex`, client-side) e JWT por JWKS/RS256 ficam para fase posterior do E4.
+
+## O que NÃO é (ainda)
+
+Inspeção/guardrails — prompt injection, PII, SAFE-MCP de payload (E5), idempotência/circuit breaker/reconexão de upstream (E6/E9–E12), traces OpenTelemetry. Os pacotes desses estágios já existem como placeholders.
 
 ## Quickstart
 
@@ -42,18 +55,18 @@ task run                       # serve --transport http
 task inspect
 ```
 
-No `tools/list` você verá os nomes namespaced; uma tool permitida retorna o resultado real do upstream e uma negada volta erro JSON-RPC — sempre emitindo uma linha de auditoria. Para a validação completa do E2 (allow/deny/default-deny/rate limit), veja **[Smoke test](#smoke-test-validação-manual)**.
+No `tools/list` você verá só os nomes namespaced que o principal pode chamar (E3); uma tool permitida retorna o resultado real do upstream, e chamar direto uma tool oculta/negada volta erro JSON-RPC — sempre emitindo uma linha de auditoria. Para a validação completa (auth/discovery/allow/deny/rate limit), veja **[Smoke test](#smoke-test-validação-manual)**.
 
 ## Comandos
 
 | Comando | Descrição |
 | --- | --- |
-| `mcpgate serve --config <path> [--transport http\|stdio]` | Carrega a config e sobe o proxy. Default `http`; `stdio` para laptop/single-user. |
+| `mcpgate serve --config <path> [--transport http\|stdio]` | Carrega a config e sobe o proxy. Default `http` (auth via bloco `auth`); `stdio` para laptop/single-user (sem auth, `anonymous`). |
 | `mcpgate validate-config --config <path>` | Valida o arquivo estaticamente (inclui política e rate limit); sai ≠ 0 com mensagem clara em caso de erro. |
 
 ## Configuração
 
-Ver [configs/mcpgate.example.yaml](configs/mcpgate.example.yaml). Qualquer chave pode ser sobrescrita por ambiente com o prefixo `MCPGATE_` (ex.: `MCPGATE_AUDIT_SINK=file`). Os blocos relevantes do E2 são `policy` (RBAC default-deny), `rate_limit` (quota por agente) e `default_agent` (principal provisório).
+Ver [configs/mcpgate.example.yaml](configs/mcpgate.example.yaml). Qualquer chave pode ser sobrescrita por ambiente com o prefixo `MCPGATE_` (ex.: `MCPGATE_AUDIT_SINK=file`, `MCPGATE_AUTH_JWT_SECRET=…`) — prático para não versionar segredos. Blocos principais: `auth` (autenticação norte: `none`/`apikey`/`jwt`, scopes e keys — só HTTP), `policy` (RBAC default-deny, base também da descoberta filtrada do E3), `rate_limit` (quota por agente), `default_agent` (principal do caminho stdio / HTTP sem auth) e `upstreams[].bearer_token` (auth sul, opcional).
 
 ## Smoke test (validação manual)
 
@@ -97,20 +110,36 @@ tail -f mcpgate-audit.jsonl   # acompanhe a auditoria em outro terminal
 task inspect-http   # abre a UI; escolha "Streamable HTTP" e aponte para http://localhost:8080
 ```
 
-No `tools/list` aparecem os nomes namespaced — inclusive `everything.add`
-(negada): **sumir da lista é E3**; aqui ela só é bloqueada no `tools/call`.
+No `tools/list` aparece **só `everything.echo`** (a permitida): com o E3 a tool
+negada `everything.add` e a default-deny `everything.printEnv` ficam **invisíveis**.
+Chamá-las direto ainda erra limpo (ver passos 7–8) — invisível **e** bloqueada.
 
-**5. Abrir uma sessão MCP (cURL)** — guarda o `Mcp-Session-Id`:
+**5. Abrir uma sessão MCP (cURL)** — guarda o `Mcp-Session-Id` e define o helper
+`call` (funciona em bash e zsh):
 
 ```bash
 URL=http://localhost:8080
-H='-H Content-Type:application/json -H Accept:application/json,text/event-stream'
-SID=$(curl -sS -D - -o /dev/null -X POST $URL $H \
+
+# initialize: captura o Mcp-Session-Id do header de resposta
+SID=$(curl -sS -D - -o /dev/null -X POST "$URL" \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}' \
   | awk -F': ' 'tolower($1)=="mcp-session-id"{gsub(/\r/,"",$2);print $2}')
-curl -sS -o /dev/null -X POST $URL $H -H "Mcp-Session-Id: $SID" \
+
+# helper: manda um tools/call e mostra só o payload da resposta SSE
+call(){ curl -sS -X POST "$URL" \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -H "Mcp-Session-Id: $SID" \
+  -d "$1" | grep '^data:' | sed 's/^data: //'; }
+
+# completa o handshake
+curl -sS -o /dev/null -X POST "$URL" \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -H "Mcp-Session-Id: $SID" \
   -d '{"jsonrpc":"2.0","method":"notifications/initialized"}'
-call(){ curl -sS -X POST $URL $H -H "Mcp-Session-Id: $SID" -d "$1" | grep '^data:' | sed 's/^data: //'; }
 ```
 
 **6. Chamada permitida** — `everything.echo` está no `allow`:
@@ -142,10 +171,11 @@ bem acima do burst de uma vez:
 
 ```bash
 for n in $(seq 1 30); do
-  call "{\"jsonrpc\":\"2.0\",\"id\":$((100+n)),\"method\":\"tools/call\",\"params\":{\"name\":\"everything.echo\",\"arguments\":{\"message\":\"r\"}}}"
-done | sort | uniq -c
-# => parte com "result" (admitidas) e parte com {"code":-32002,"message":"rate limit excedido ..."}
-# a conexão segue VIVA (um novo call após o estouro responde normalmente).
+  call "{\"jsonrpc\":\"2.0\",\"id\":$n,\"method\":\"tools/call\",\"params\":{\"name\":\"everything.echo\",\"arguments\":{\"message\":\"r\"}}}"
+done | grep -o '"result"\|-32002' | sort | uniq -c
+# => tally tipo:  17 "result"   e   13 -32002
+# parte admitida + parte barrada por rate limit. A conexão segue VIVA:
+# um novo `call` depois do estouro volta a responder normalmente.
 ```
 
 **10. Regressão stdio** — o mesmo `p.server` roda em stdio:
@@ -154,8 +184,66 @@ done | sort | uniq -c
 task inspect   # sobe o gateway como subprocesso stdio e repassa
 ```
 
+### Auth norte (E4) — prova sobre HTTP, sem mocks externos
+
+Use [configs/mcpgate.auth.yaml](configs/mcpgate.auth.yaml): mesmo upstream `everything`,
+mas com `auth.mode: apikey` e duas keys — `alice-key` (com o scope `tools:call`) e
+`bob-key` (sem o scope). A autenticação é o próprio gateway validando o
+`Authorization: Bearer`; não é preciso subir nenhum servidor de identidade.
+
+```bash
+./bin/mcpgate serve --config configs/mcpgate.auth.yaml &   # transport http (default)
+URL=http://localhost:8080
+```
+
+**A) Sem token → 401 + `WWW-Authenticate`:**
+
+```bash
+curl -sS -o /dev/null -w '%{http_code}\n%header{www-authenticate}\n' -X POST "$URL" \
+  -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"ping"}'
+# => 401
+#    Bearer resource_metadata="...", scope="tools:call"
+```
+
+**B) Token sem o scope exigido → 403:**
+
+```bash
+curl -sS -o /dev/null -w '%{http_code}\n' -X POST "$URL" -H 'Authorization: Bearer bob-key' \
+  -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"ping"}'
+# => 403   (insufficient scope)
+```
+
+**C) Token válido → handshake passa e `tools/list` vem filtrado pelo principal:**
+
+```bash
+TOKEN="alice-key"
+SID=$(curl -sS -D - -o /dev/null -X POST "$URL" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}' \
+  | awk -F': ' 'tolower($1)=="mcp-session-id"{gsub(/\r/,"",$2);print $2}')
+
+curl -sS -o /dev/null -X POST "$URL" -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+  -H "Mcp-Session-Id: $SID" -d '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+
+curl -sS -X POST "$URL" -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+  -H "Mcp-Session-Id: $SID" \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | grep '^data:' | sed 's/^data: //'
+# => só everything.echo na lista (política do principal alice + E3); auditoria com "identity":"alice"
+```
+
+> **JWT em vez de API key:** troque o bloco por `auth: { mode: jwt, jwt: { secret: "..." } }`
+> e mande um JWT HS256 com claim `sub` (o principal) e `exp`. Token expirado → 401;
+> assinatura/`alg` inválidos → 401; falta de scope exigido → 403.
+
+O caminho **stdio ignora `auth`** por completo (identidade `anonymous`).
+
 ## Stack
 
-- **Go 1.25+** — binário único.
-- SDK oficial [`github.com/modelcontextprotocol/go-sdk`](https://github.com/modelcontextprotocol/go-sdk).
-- Config: [`koanf/v2`](https://github.com/knadh/koanf). CLI: [`cobra`](https://github.com/spf13/cobra). Auditoria: `log/slog` (stdlib).
+- **Go 1.25+** — binário único, `CGO_ENABLED=0`.
+- SDK oficial [`github.com/modelcontextprotocol/go-sdk`](https://github.com/modelcontextprotocol/go-sdk) (pacotes `mcp` e `jsonrpc`).
+- Config: [`koanf/v2`](https://github.com/knadh/koanf). CLI: [`cobra`](https://github.com/spf13/cobra). Auditoria: `log/slog` (stdlib). Rate limit: [`golang.org/x/time/rate`](https://pkg.go.dev/golang.org/x/time/rate) (in-process).
