@@ -13,6 +13,8 @@ import (
 
 	sdkauth "github.com/modelcontextprotocol/go-sdk/auth"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/danilomendes/mcpgate/internal/auth"
 )
 
 // httpShutdownTimeout limita o tempo de drenagem do servidor HTTP no shutdown
@@ -71,6 +73,17 @@ func (p *Proxy) httpHandler() http.Handler {
 	}, nil)
 	if p.verifier != nil {
 		handler = sdkauth.RequireBearerToken(p.verifier, p.authOpts)(handler)
+	}
+
+	// Protected Resource Metadata (RFC 9728): se configurado, serve o metadata
+	// num caminho dedicado (público, fora da auth) para o cliente descobrir o
+	// authorization server a partir do WWW-Authenticate. Sem metadata, o handler
+	// MCP cru responde a tudo (compat).
+	if meta := auth.MetadataHandler(p.cfg.Auth); meta != nil {
+		mux := http.NewServeMux()
+		mux.Handle(auth.ProtectedResourceMetadataPath, meta)
+		mux.Handle("/", handler)
+		return mux
 	}
 	return handler
 }

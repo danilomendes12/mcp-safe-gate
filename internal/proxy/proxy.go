@@ -28,6 +28,7 @@ import (
 	"github.com/danilomendes/mcpgate/internal/audit"
 	"github.com/danilomendes/mcpgate/internal/auth"
 	"github.com/danilomendes/mcpgate/internal/config"
+	"github.com/danilomendes/mcpgate/internal/credstore"
 	"github.com/danilomendes/mcpgate/internal/policy"
 )
 
@@ -54,6 +55,13 @@ type Proxy struct {
 	// HTTP segue anônimo, igual ao E2. stdio nunca usa auth.
 	verifier sdkauth.TokenVerifier
 	authOpts *sdkauth.RequireBearerTokenOptions
+
+	// Auth do transporte sul (E4-sul). credStore resolve a credencial por
+	// (principal, upstream) dos upstreams per_user; nil quando nenhum é per_user.
+	// southAuth indexa a config de auth sul por nome de upstream, consumida pelo
+	// southAuthMiddleware (fail-closed) e por buildTransport (injeção).
+	credStore credstore.Store
+	southAuth map[string]config.UpstreamAuth
 }
 
 // New conecta a todos os upstreams, descobre e registra suas tools, e devolve
@@ -67,15 +75,22 @@ func New(ctx context.Context, cfg *config.Config, auditLog *audit.Logger) (*Prox
 		return nil, err
 	}
 
+	credStore, err := newCredentialStore(cfg.Credentials)
+	if err != nil {
+		return nil, err
+	}
+
 	p := &Proxy{
-		cfg:      cfg,
-		auditLog: auditLog,
-		server:   mcp.NewServer(&mcp.Implementation{Name: "mcpgate", Version: version}, nil),
-		resolver: auth.NewStaticResolver(cfg.DefaultAgent),
-		limiter:  newPerAgentLimiter(cfg.RateLimit),
-		engine:   policy.NewEngine(cfg.Policy),
-		verifier: verifier,
-		authOpts: authOpts,
+		cfg:       cfg,
+		auditLog:  auditLog,
+		server:    mcp.NewServer(&mcp.Implementation{Name: "mcpgate", Version: version}, nil),
+		resolver:  auth.NewStaticResolver(cfg.DefaultAgent),
+		limiter:   newPerAgentLimiter(cfg.RateLimit),
+		engine:    policy.NewEngine(cfg.Policy),
+		verifier:  verifier,
+		authOpts:  authOpts,
+		credStore: credStore,
+		southAuth: southAuthByUpstream(cfg.Upstreams),
 	}
 
 	// Pipeline de governança (estágios 1–3). AddReceivingMiddleware(m1,m2,...)
@@ -86,11 +101,16 @@ func New(ctx context.Context, cfg *config.Config, auditLog *audit.Logger) (*Prox
 	// A descoberta (E3) e o RBAC (E2) compartilham o MESMO Engine: o que some do
 	// tools/list é exatamente o que seria negado no tools/call. A auditoria é o
 	// último elo: allow é auditado no forwardHandler; deny no middleware que barrou.
+	// southAuthMiddleware roda DEPOIS do RBAC (a tool já foi permitida ao
+	// principal) e ANTES do forward: resolve a credencial sul por usuário e faz o
+	// fail-closed se não houver — a credencial só é buscada para chamadas já
+	// autorizadas pela política (menor privilégio / coerência com E2).
 	p.server.AddReceivingMiddleware(
 		p.resolveMiddleware,
 		p.discoveryMiddleware,
 		p.rateLimitMiddleware,
 		p.policyMiddleware,
+		p.southAuthMiddleware,
 	)
 
 	for _, up := range cfg.Upstreams {

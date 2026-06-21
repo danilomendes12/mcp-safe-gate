@@ -52,7 +52,7 @@ func TestForwardPassthroughAndAudit(t *testing.T) {
 	ctx := context.Background()
 
 	auditPath := filepath.Join(t.TempDir(), "audit.jsonl")
-	auditLog, err := audit.New(config.Audit{Sink: config.SinkFile, Path: auditPath})
+	auditLog, err := audit.New(config.Audit{Sink: config.SinkFile, Path: auditPath}, false)
 	if err != nil {
 		t.Fatalf("audit: %v", err)
 	}

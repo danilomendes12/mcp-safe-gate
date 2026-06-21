@@ -45,6 +45,23 @@ const (
 	AuthNone   = "none"   // sem autenticação: principal cai no default_agent (compat E2)
 	AuthAPIKey = "apikey" // bearer = API key estática mapeada a um principal
 	AuthJWT    = "jwt"    // bearer = JWT HS256 assinado com segredo compartilhado
+	AuthOIDC   = "oidc"   // bearer = JWT RS256 de um IdP externo, validado via JWKS
+)
+
+// Tipos de autenticação do transporte sul (gateway → upstream HTTP). Determinam
+// COM QUAL credencial o gateway chama o upstream. Vazio + bearer_token preenchido
+// => service_bearer (compat). Confundir conta de serviço com per_user é falha de
+// segurança (SAFE-T1307, confused deputy) — ver docs/BACKLOG E4-sul.
+const (
+	SouthAuthServiceBearer  = "service_bearer"   // bearer estático único do gateway p/ o upstream
+	SouthAuthServiceOAuthCC = "service_oauth_cc" // OAuth client-credentials (token que renova sozinho)
+	SouthAuthPerUser        = "per_user"         // credencial DELEGADA: derivada do principal do norte
+)
+
+// Backends do vault de credenciais sul (per_user). file = arquivo cifrado em
+// repouso (AES-256-GCM, puro-Go, sem CGO); a interface fica pronta p/ Vault/KMS.
+const (
+	CredStoreFile = "file"
 )
 
 // Config é a configuração completa do gateway.
@@ -65,6 +82,10 @@ type Config struct {
 	RateLimit RateLimit `koanf:"rate_limit"`
 	// Audit controla o sink/formato do log de auditoria.
 	Audit Audit `koanf:"audit"`
+	// Credentials é o vault de credenciais sul por (principal, upstream), usado
+	// pelos upstreams com auth.type=per_user (E4-sul). Vazio quando nenhum
+	// upstream é per_user.
+	Credentials Credentials `koanf:"credentials"`
 }
 
 // Upstream descreve um servidor MCP upstream.
@@ -80,8 +101,64 @@ type Upstream struct {
 	// BearerToken, se presente, é injetado como `Authorization: Bearer` em cada
 	// requisição ao upstream (leg sul, transport=http). É o segredo que o gateway
 	// usa para se autenticar no upstream — NUNCA é exposto ao agente. Aceita
-	// override por ambiente (ex.: MCPGATE_UPSTREAMS_0_BEARER_TOKEN).
+	// override por ambiente (ex.: MCPGATE_UPSTREAMS_0_BEARER_TOKEN). Atalho
+	// (compat) para auth.type=service_bearer com o segredo inline.
 	BearerToken string `koanf:"bearer_token"`
+	// Auth descreve COM QUAL credencial o gateway chama este upstream (leg sul /
+	// E4-sul). Vazio + BearerToken preenchido => service_bearer.
+	Auth UpstreamAuth `koanf:"auth"`
+}
+
+// UpstreamAuth descreve a credencial do leg SUL de um upstream (E4-sul): conta de
+// serviço (uma credencial do gateway) OU delegada por usuário (derivada do
+// principal do norte). Misturar os dois modelos é falha de segurança: uma
+// credencial compartilhada num upstream que age por conta vira confused deputy
+// (SAFE-T1307) e qualquer agente autenticado passa a agir na conta do gateway.
+type UpstreamAuth struct {
+	// Type é "service_bearer", "service_oauth_cc" ou "per_user". Vazio herda o
+	// comportamento legado (service_bearer se BearerToken estiver preenchido).
+	Type string `koanf:"type"`
+	// BearerEnv é o nome da variável de ambiente com o bearer estático
+	// (service_bearer). Mantém o segredo fora do YAML versionado.
+	BearerEnv string `koanf:"bearer_env"`
+	// OAuth configura o fluxo client-credentials (service_oauth_cc).
+	OAuth UpstreamOAuthCC `koanf:"oauth"`
+	// DiscoveryBearerEnv (per_user, opcional) é a env com o bearer usado APENAS
+	// para conectar e listar tools no boot, quando o upstream exige auth até para
+	// tools/list. As chamadas de tool (tools/call) usam SEMPRE a credencial do
+	// usuário; este token de descoberta nunca é usado para agir por conta.
+	DiscoveryBearerEnv string `koanf:"discovery_bearer_env"`
+}
+
+// UpstreamOAuthCC configura a conta de serviço via OAuth 2.0 client-credentials
+// (RFC 6749 §4.4): o gateway obtém e renova sozinho um access token p/ o upstream.
+type UpstreamOAuthCC struct {
+	// TokenURL é o endpoint de token do authorization server.
+	TokenURL string `koanf:"token_url"`
+	// ClientIDEnv / ClientSecretEnv são as envs com as credenciais do client.
+	ClientIDEnv     string `koanf:"client_id_env"`
+	ClientSecretEnv string `koanf:"client_secret_env"`
+	// Scopes solicitados ao authorization server (menor privilégio).
+	Scopes []string `koanf:"scopes"`
+}
+
+// Credentials configura o vault de credenciais sul por (principal, upstream)
+// usado pelos upstreams per_user (E4-sul). Tier 0 embarcado: arquivo cifrado em
+// repouso; a interface (internal/credstore) fica pronta p/ Vault/KMS no Tier 1.
+type Credentials struct {
+	// Store é o backend: "file" (arquivo cifrado AES-256-GCM). Vazio => nenhum
+	// vault configurado (só é exigido se houver upstream per_user).
+	Store string `koanf:"store"`
+	// File configura o backend de arquivo cifrado.
+	File CredentialsFile `koanf:"file"`
+}
+
+// CredentialsFile aponta o arquivo cifrado e a fonte da chave de cifra.
+type CredentialsFile struct {
+	// Path é o arquivo cifrado (criado/atualizado pelo subcomando `mcpgate cred`).
+	Path string `koanf:"path"`
+	// KeyEnv é a env com a chave AES-256 em base64 (32 bytes). NUNCA versionada.
+	KeyEnv string `koanf:"key_env"`
 }
 
 // Auth descreve a autenticação do cliente MCP no transporte norte (estágio 1).
@@ -96,10 +173,35 @@ type Auth struct {
 	// ResourceMetadataURL é opcional: vai no header WWW-Authenticate para o fluxo
 	// de protected resource metadata (RFC 9728).
 	ResourceMetadataURL string `koanf:"resource_metadata_url"`
+	// Resource é o identificador deste resource server (RFC 9728) — tipicamente a
+	// URL pública do gateway. Vai no campo `resource` do Protected Resource
+	// Metadata. Opcional; habilita o endpoint de metadata junto com ResourceMetadataURL.
+	Resource string `koanf:"resource"`
 	// APIKeys mapeia cada key estática a um principal (mode=apikey).
 	APIKeys []APIKey `koanf:"api_keys"`
 	// JWT configura a verificação de JWT HS256 (mode=jwt).
 	JWT JWT `koanf:"jwt"`
+	// OIDC configura a verificação de JWT RS256 de um IdP externo via JWKS (mode=oidc).
+	OIDC OIDC `koanf:"oidc"`
+}
+
+// OIDC configura a validação de JWT RS256 emitido por um IdP externo (mode=oidc).
+// As chaves públicas vêm do JWKS do IdP (jwks_uri), casadas pelo `kid` do header
+// e cacheadas com rotação. A assinatura, `iss` e `aud` são checados aqui; exp e
+// scopes ficam com o middleware do SDK (não duplicamos).
+type OIDC struct {
+	// Issuer é validado contra a claim `iss`. Se JWKSURI estiver vazio, o
+	// jwks_uri é descoberto via <issuer>/.well-known/openid-configuration.
+	Issuer string `koanf:"issuer"`
+	// JWKSURI é a URL do JWKS do IdP. Opcional se Issuer permitir discovery.
+	JWKSURI string `koanf:"jwks_uri"`
+	// Audience, se setado, é validado contra a claim `aud`.
+	Audience string `koanf:"audience"`
+	// Algorithms são os algoritmos de assinatura aceitos. Vazio => ["RS256"].
+	// Algoritmos não suportados (ex.: "none", "HS256") são recusados.
+	Algorithms []string `koanf:"algorithms"`
+	// PrincipalClaim é a claim usada como principal. Vazio => "sub".
+	PrincipalClaim string `koanf:"principal_claim"`
 }
 
 // APIKey associa uma API key estática a um principal e a scopes opcionais.
@@ -208,6 +310,7 @@ func (c *Config) Validate() error {
 	}
 
 	seen := make(map[string]struct{}, len(c.Upstreams))
+	perUser := false
 	for i, u := range c.Upstreams {
 		who := fmt.Sprintf("upstreams[%d]", i)
 		if strings.TrimSpace(u.Name) == "" {
@@ -225,6 +328,9 @@ func (c *Config) Validate() error {
 			if len(u.Command) == 0 {
 				errs = append(errs, fmt.Errorf("%s.command: obrigatório para transport=stdio", who))
 			}
+			if u.Auth.Type != "" || u.BearerToken != "" {
+				errs = append(errs, fmt.Errorf("%s.auth: auth sul só se aplica a transport=http", who))
+			}
 		case TransportHTTP:
 			if strings.TrimSpace(u.URL) == "" {
 				errs = append(errs, fmt.Errorf("%s.url: obrigatório para transport=http", who))
@@ -234,7 +340,14 @@ func (c *Config) Validate() error {
 		default:
 			errs = append(errs, fmt.Errorf("%s.transport: %q inválido (use stdio|http)", who, u.Transport))
 		}
+
+		errs = append(errs, u.Auth.validate(who)...)
+		if u.Auth.Type == SouthAuthPerUser {
+			perUser = true
+		}
 	}
+
+	errs = append(errs, c.Credentials.validate(perUser)...)
 
 	switch c.Audit.Sink {
 	case SinkStdout:
@@ -283,8 +396,70 @@ func (a Auth) validate() []error {
 		if strings.TrimSpace(a.JWT.Secret) == "" {
 			errs = append(errs, errors.New("auth.jwt.secret: obrigatório para mode=jwt (HS256)"))
 		}
+	case AuthOIDC:
+		// Precisa de pelo menos um modo de localizar as chaves: jwks_uri explícito
+		// ou issuer (para OIDC discovery). default-deny de config ambígua.
+		if strings.TrimSpace(a.OIDC.JWKSURI) == "" && strings.TrimSpace(a.OIDC.Issuer) == "" {
+			errs = append(errs, errors.New("auth.oidc: defina jwks_uri ou issuer (para discovery) em mode=oidc"))
+		}
+		for _, alg := range a.OIDC.Algorithms {
+			if alg != "RS256" {
+				errs = append(errs, fmt.Errorf("auth.oidc.algorithms: %q não suportado (apenas RS256)", alg))
+			}
+		}
 	default:
-		errs = append(errs, fmt.Errorf("auth.mode: %q inválido (use none|apikey|jwt)", a.Mode))
+		errs = append(errs, fmt.Errorf("auth.mode: %q inválido (use none|apikey|jwt|oidc)", a.Mode))
+	}
+	return errs
+}
+
+// validate checa o bloco de auth sul de um upstream. Vazio é válido (=> legado:
+// service_bearer se bearer_token estiver preenchido, senão sem auth sul).
+func (u UpstreamAuth) validate(who string) []error {
+	var errs []error
+	switch u.Type {
+	case "", SouthAuthServiceBearer:
+		// service_bearer: o segredo vem de bearer_env OU do bearer_token inline.
+	case SouthAuthServiceOAuthCC:
+		if strings.TrimSpace(u.OAuth.TokenURL) == "" {
+			errs = append(errs, fmt.Errorf("%s.auth.oauth.token_url: obrigatório para type=service_oauth_cc", who))
+		}
+		if strings.TrimSpace(u.OAuth.ClientIDEnv) == "" {
+			errs = append(errs, fmt.Errorf("%s.auth.oauth.client_id_env: obrigatório para type=service_oauth_cc", who))
+		}
+		if strings.TrimSpace(u.OAuth.ClientSecretEnv) == "" {
+			errs = append(errs, fmt.Errorf("%s.auth.oauth.client_secret_env: obrigatório para type=service_oauth_cc", who))
+		}
+	case SouthAuthPerUser:
+		// O vault é validado globalmente (precisa estar configurado se há per_user).
+	default:
+		errs = append(errs, fmt.Errorf("%s.auth.type: %q inválido (use service_bearer|service_oauth_cc|per_user)", who, u.Type))
+	}
+	return errs
+}
+
+// validate checa o vault de credenciais sul. Só é exigido quando há ao menos um
+// upstream per_user (perUser=true); caso contrário, um bloco vazio é válido.
+func (c Credentials) validate(perUser bool) []error {
+	var errs []error
+	if !perUser {
+		if c.Store != "" && c.Store != CredStoreFile {
+			errs = append(errs, fmt.Errorf("credentials.store: %q inválido (use file)", c.Store))
+		}
+		return errs
+	}
+	switch c.Store {
+	case CredStoreFile:
+		if strings.TrimSpace(c.File.Path) == "" {
+			errs = append(errs, errors.New("credentials.file.path: obrigatório para store=file"))
+		}
+		if strings.TrimSpace(c.File.KeyEnv) == "" {
+			errs = append(errs, errors.New("credentials.file.key_env: obrigatório para store=file"))
+		}
+	case "":
+		errs = append(errs, errors.New("credentials.store: obrigatório quando há upstream com auth.type=per_user"))
+	default:
+		errs = append(errs, fmt.Errorf("credentials.store: %q inválido (use file)", c.Store))
 	}
 	return errs
 }

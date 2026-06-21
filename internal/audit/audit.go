@@ -40,6 +40,10 @@ type Record struct {
 	DurationMS int64    // latência da chamada ao upstream (0 quando negada antes do forward)
 	OK         bool     // true se a chamada teve sucesso a nível de transporte
 	Error      string   // mensagem de erro / motivo do deny (vazio se OK e allow)
+	// UpstreamCred é a REFERÊNCIA não-secreta da credencial sul usada na chamada
+	// ao upstream (E4-sul), ligando o humano do norte à ação no upstream sem vazar
+	// o segredo. Vazio para upstreams de conta de serviço ou caminhos negados.
+	UpstreamCred string
 }
 
 // IdentityAnonymous é o principal usado enquanto o estágio de auth (E4) não
@@ -54,7 +58,11 @@ const (
 
 // New constrói um Logger a partir da config de auditoria. Quando o sink é um
 // arquivo, o caller deve chamar Close para liberar o descritor.
-func New(cfg config.Audit) (*Logger, error) {
+//
+// stdoutReserved indica que o transporte norte é stdio e, portanto, stdout é o
+// canal JSON-RPC: nesse caso o sink "stdout" cai para stderr para não corromper
+// o protocolo (toda linha de log em stdout viraria uma mensagem MCP inválida).
+func New(cfg config.Audit, stdoutReserved bool) (*Logger, error) {
 	var w io.Writer
 	var closer io.Closer
 
@@ -66,7 +74,11 @@ func New(cfg config.Audit) (*Logger, error) {
 		}
 		w, closer = f, f
 	default: // SinkStdout (já validado em config)
-		w = os.Stdout
+		if stdoutReserved {
+			w = os.Stderr
+		} else {
+			w = os.Stdout
+		}
 	}
 
 	// slog.NewJSONHandler já emite uma linha JSON por registro: é o nosso JSONL.
@@ -105,6 +117,7 @@ func (l *Logger) Emit(r Record) {
 		slog.Int64("duration_ms", r.DurationMS),
 		slog.Bool("ok", r.OK),
 		slog.String("error", r.Error),
+		slog.String("upstream_cred", r.UpstreamCred),
 	)
 }
 

@@ -29,6 +29,34 @@ upstreams:
     # MCPGATE_UPSTREAMS_1_BEARER_TOKEN=...
     bearer_token: ""
 
+  # Exemplo http "por conta do usuário" (E4-sul, delegated): a tool age numa
+  # conta específica (GitHub, Drive, Jira...). A credencial sul É DERIVADA do
+  # principal do norte — uma credencial compartilhada aqui seria confused deputy
+  # (SAFE-T1307), e repassar o token do norte seria token passthrough (proibido
+  # pela spec de auth do MCP, abre SAFE-T1308). Requer o bloco `credentials`.
+  - name: github
+    transport: http
+    url: "https://api.githubcopilot.com/mcp/"
+    auth:
+      # service_bearer | service_oauth_cc | per_user
+      type: per_user
+      # Opcional: bearer de baixo privilégio usado SÓ para conectar e listar
+      # tools no boot (nunca para agir por conta). Vem de uma env.
+      discovery_bearer_env: "GITHUB_DISCOVERY_TOKEN"
+
+  # Exemplo de conta de serviço via OAuth client-credentials (E4-sul, should): o
+  # gateway obtém e RENOVA sozinho o token. Use quando a tool NÃO age por usuário.
+  # - name: internal-api
+  #   transport: http
+  #   url: "https://internal.example/mcp"
+  #   auth:
+  #     type: service_oauth_cc
+  #     oauth:
+  #       token_url: "https://idp.example/oauth/token"
+  #       client_id_env: "INTERNAL_CLIENT_ID"
+  #       client_secret_env: "INTERNAL_CLIENT_SECRET"
+  #       scopes: ["mcp.invoke"]
+
 # Autenticação do cliente no transporte norte (estágio 1 / E4). SÓ tem efeito no
 # caminho HTTP; em stdio a identidade é sempre "anonymous". O principal resolvido
 # aqui substitui o default_agent e alimenta o RBAC, a descoberta filtrada (E3) e
@@ -37,7 +65,8 @@ upstreams:
 auth:
   # "none" (default) = sem auth, principal cai no default_agent (compat E2).
   # "apikey" = bearer é uma API key estática mapeada a um principal.
-  # "jwt"    = bearer é um JWT HS256 assinado com o segredo abaixo.
+  # "jwt"    = bearer é um JWT HS256 assinado com o segredo compartilhado abaixo.
+  # "oidc"   = bearer é um JWT RS256 de um IdP externo, validado via JWKS.
   mode: "none"
 
   # Scopes exigidos em TODA requisição autenticada (o middleware do SDK checa;
@@ -47,6 +76,12 @@ auth:
   # Opcional: URL de protected resource metadata (RFC 9728) no WWW-Authenticate.
   resource_metadata_url: ""
 
+  # Opcional: identificador deste resource server (RFC 9728) — tipicamente a URL
+  # pública do gateway. Com `resource` + um issuer (oidc/jwt), o gateway publica
+  # o metadata em /.well-known/oauth-protected-resource para o cliente descobrir
+  # o authorization server.
+  resource: ""
+
   # mode=apikey: cada key estática vira um principal. Prefira injetar a key por
   # ambiente (MCPGATE_AUTH_API_KEYS_0_KEY=...) a versioná-la.
   api_keys:
@@ -54,13 +89,24 @@ auth:
       principal: "ci-bot"
       scopes: ["tools:call"]
 
-  # mode=jwt: verificação HS256 (segredo compartilhado). RS256/JWKS e OAuth
-  # completo ficam para fase posterior do E4.
+  # mode=jwt: verificação HS256 (segredo compartilhado).
   jwt:
     secret: ""            # obrigatório quando mode=jwt
     principal_claim: "sub" # claim usada como principal (vazio => "sub")
     issuer: ""            # se setado, validado contra a claim `iss`
     audience: ""          # se setado, validado contra a claim `aud`
+
+  # mode=oidc: valida JWT RS256 de um IdP externo. As chaves públicas vêm do
+  # JWKS (jwks_uri), casadas pelo `kid` do header, cacheadas com rotação. Defina
+  # jwks_uri OU issuer (o jwks_uri é descoberto via openid-configuration).
+  # Fecha a porta a um Rogue Authorization Server (SAFE-T1306): só passam tokens
+  # assinados pela chave do issuer configurado.
+  oidc:
+    issuer: ""            # ex.: "https://accounts.google.com" (valida `iss` + discovery)
+    jwks_uri: ""          # opcional se issuer permitir discovery
+    audience: ""          # se setado, validado contra a claim `aud`
+    algorithms: ["RS256"] # allowlist; "none"/HS256 são recusados
+    principal_claim: "sub"
 
 # RBAC por ferramenta (estágio 2). Postura default-deny: o que não casa nenhuma
 # lista é negado no tools/call. deny tem precedência sobre allow. A tool negada
@@ -89,8 +135,19 @@ rate_limit:
   rps: 10
   burst: 20
 
-# Log de auditoria: uma linha JSONL por tools/call, com `decision` e `identity`.
+# Log de auditoria: uma linha JSONL por tools/call, com `decision`, `identity` e
+# `upstream_cred` (a REFERÊNCIA não-secreta da credencial sul usada — E4-sul).
 audit:
   sink: "stdout"     # "stdout" | "file"
   format: "jsonl"
   path: ""           # caminho do arquivo quando sink=file
+
+# Vault de credenciais sul por (principal, upstream) — E4-sul. Obrigatório quando
+# algum upstream usa auth.type=per_user. Tier 0 embarcado: arquivo cifrado em
+# repouso (AES-256-GCM, puro-Go, sem CGO). A chave de cifra vem da env apontada
+# por key_env (NUNCA versionada). Popule com `mcpgate cred put`.
+credentials:
+  store: "file"      # "file" (ou vazio quando não há upstream per_user)
+  file:
+    path: "secrets/creds.enc"
+    key_env: "MCPGATE_CRED_KEY" # base64 de 32 bytes (AES-256)

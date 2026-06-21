@@ -61,6 +61,8 @@ func NewVerifier(cfg config.Auth) (sdkauth.TokenVerifier, *sdkauth.RequireBearer
 		return apiKeyVerifier(cfg.APIKeys), opts, nil
 	case config.AuthJWT:
 		return jwtVerifier(cfg.JWT), opts, nil
+	case config.AuthOIDC:
+		return oidcVerifier(cfg.OIDC), opts, nil
 	default:
 		return nil, nil, fmt.Errorf("auth.mode %q não suportado", cfg.Mode)
 	}
@@ -128,8 +130,8 @@ func jwtVerifier(cfg config.JWT) sdkauth.TokenVerifier {
 // verifyHS256 valida a assinatura HS256 de um JWT compacto e devolve as claims.
 // Não checa expiração (responsabilidade do middleware do SDK).
 func verifyHS256(token string, secret []byte) (map[string]any, error) {
-	parts := strings.Split(token, ".")
-	if len(parts) != 3 {
+	parts := splitJWT(token)
+	if parts == nil {
 		return nil, fmt.Errorf("jwt malformado: %w", sdkauth.ErrInvalidToken)
 	}
 
@@ -137,9 +139,7 @@ func verifyHS256(token string, secret []byte) (map[string]any, error) {
 		Alg string `json:"alg"`
 		Typ string `json:"typ"`
 	}
-	if raw, err := decodeSegment(parts[0]); err != nil {
-		return nil, fmt.Errorf("header jwt: %w", sdkauth.ErrInvalidToken)
-	} else if err := json.Unmarshal(raw, &header); err != nil {
+	if err := decodeJSONSegment(parts[0], &header); err != nil {
 		return nil, fmt.Errorf("header jwt: %w", sdkauth.ErrInvalidToken)
 	}
 	if header.Alg != "HS256" {
@@ -158,20 +158,35 @@ func verifyHS256(token string, secret []byte) (map[string]any, error) {
 		return nil, fmt.Errorf("assinatura jwt inválida: %w", sdkauth.ErrInvalidToken)
 	}
 
-	rawClaims, err := decodeSegment(parts[1])
-	if err != nil {
-		return nil, fmt.Errorf("payload jwt: %w", sdkauth.ErrInvalidToken)
-	}
 	var claims map[string]any
-	if err := json.Unmarshal(rawClaims, &claims); err != nil {
+	if err := decodeJSONSegment(parts[1], &claims); err != nil {
 		return nil, fmt.Errorf("payload jwt: %w", sdkauth.ErrInvalidToken)
 	}
 	return claims, nil
 }
 
+// splitJWT divide um JWT compacto em [header, payload, signature]. Devolve nil se
+// não houver exatamente três segmentos.
+func splitJWT(token string) []string {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return nil
+	}
+	return parts
+}
+
 // decodeSegment decodifica um segmento base64url (sem padding) de um JWT.
 func decodeSegment(seg string) ([]byte, error) {
 	return base64.RawURLEncoding.DecodeString(seg)
+}
+
+// decodeJSONSegment decodifica um segmento base64url e desserializa o JSON em out.
+func decodeJSONSegment(seg string, out any) error {
+	raw, err := decodeSegment(seg)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(raw, out)
 }
 
 // stringClaim devolve a claim como string, ou "" se ausente/não-string.

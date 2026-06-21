@@ -23,15 +23,18 @@ Este corte é a **demo de 5 minutos**: um **proxy passthrough verbatim** que fro
 ## E3 + E4 — o que entrou
 
 - **Descoberta filtrada** (estágio 3 / E3): o `tools/list` agora é **filtrado pela política** — a tool que o principal não pode chamar fica **invisível** na listagem, não só bloqueada no `tools/call`. Mesmo `Engine` do RBAC, então o que some da lista é exatamente o que seria negado. Mitiga enumeração de tools / capability mapping (**SAFE-T1602**).
-- **Identidade + auth** (estágio 1 / E4), **só no caminho HTTP**: o handler é envolvido pelo `RequireBearerToken` do SDK. Dois modos config-driven:
+- **Identidade + auth** (estágio 1 / E4), **só no caminho HTTP**: o handler é envolvido pelo `RequireBearerToken` do SDK. Modos config-driven:
   - `apikey` — API key estática mapeada a um principal (`auth.api_keys`);
-  - `jwt` — JWT **HS256** (segredo compartilhado), com validação de assinatura, `exp`, scopes e (opcional) `iss`/`aud`. O principal sai da claim configurável (default `sub`).
+  - `jwt` — JWT **HS256** (segredo compartilhado), com validação de assinatura, `exp`, scopes e (opcional) `iss`/`aud`. O principal sai da claim configurável (default `sub`);
+  - `oidc` — JWT **RS256 de um IdP externo**, validado via **JWKS**: as chaves públicas vêm do `jwks_uri` (ou descoberto via `<issuer>/.well-known/openid-configuration`), casadas pelo `kid`, cacheadas com **rotação**. Valida assinatura, `iss` e `aud`. Fecha a porta a um **Rogue Authorization Server (SAFE-T1306)**.
 
   O principal resolvido do token substitui o `default_agent` e alimenta RBAC, descoberta filtrada e auditoria. Sem token → **401 + `WWW-Authenticate`**; scope insuficiente → **403**. Mitiga confused deputy (**SAFE-T1307**): o gateway age pela identidade verificada do humano por trás do agente.
-- **Auth sul (upstream)**, opcional: `upstreams[].bearer_token` injeta `Authorization: Bearer` no leg sul (transport HTTP). O segredo fica só entre gateway e upstream — **nunca** chega ao agente.
+  - **Protected Resource Metadata (RFC 9728)**: com `auth.resource` + um issuer, o gateway publica `/.well-known/oauth-protected-resource` para o cliente MCP (e o Inspector) descobrirem o authorization server a partir do `WWW-Authenticate`.
+- **Auth sul (upstream)** — **com qual credencial o gateway chama o upstream** (E4-sul). Por upstream, `auth.type`:
+  - `service_bearer` — bearer estático único do gateway (compat: `bearer_token`/`bearer_env`). OK quando a tool **não** age por conta de usuário;
+  - `service_oauth_cc` — conta de serviço via **OAuth client-credentials** (token que renova sozinho), no mesmo seam `HTTPClient`;
+  - `per_user` — **autorização delegada**: a credencial sul é **derivada do principal do norte** (`(principal, upstream)` → credencial daquele usuário, num **vault cifrado** AES-256-GCM). Garante **no-passthrough** (o bearer do norte **nunca** vai ao upstream), **fail-closed** (sem credencial → negado, nunca cai na de outro usuário) e **auditoria identity-aware** (`upstream_cred` registra QUAL credencial foi usada, sem o segredo). Mitiga **confused deputy (SAFE-T1307)** e **token scope substitution (SAFE-T1308)**.
 - **Caminho stdio inalterado**: sem auth, identidade `anonymous` — o self-host de 5 min segue igual.
-
-OAuth completo (`oauthex`, client-side) e JWT por JWKS/RS256 ficam para fase posterior do E4.
 
 ## O que NÃO é (ainda)
 
@@ -241,6 +244,71 @@ curl -sS -X POST "$URL" -H "Authorization: Bearer $TOKEN" \
 > assinatura/`alg` inválidos → 401; falta de scope exigido → 403.
 
 O caminho **stdio ignora `auth`** por completo (identidade `anonymous`).
+
+### Smoke A — IdP externo de verdade (norte, `mode: oidc` / JWKS + RFC 9728)
+
+Prova que um **token RS256 de um IdP** autentica, o principal correto chega ao RBAC
+e à descoberta filtrada, e o gateway publica o Protected Resource Metadata.
+
+Use [configs/mcpgate.oidc.yaml](configs/mcpgate.oidc.yaml) e troque `issuer`/`audience`
+pelos do seu IdP (Auth0, Keycloak, Google, Entra ID…). Com só o `issuer`, o `jwks_uri`
+é descoberto via `<issuer>/.well-known/openid-configuration`.
+
+```bash
+./bin/mcpgate serve --config configs/mcpgate.oidc.yaml &
+URL=http://localhost:8080
+
+# Protected Resource Metadata (RFC 9728): público, fora da auth. O cliente MCP usa
+# isto + o WWW-Authenticate de um 401 para achar o authorization server.
+curl -sS "$URL/.well-known/oauth-protected-resource" | jq .
+# => {"resource":"http://localhost:8080","authorization_servers":["https://YOUR-IDP..."],...}
+
+# Pegue um access token RS256 do seu IdP (client_credentials/device code/etc.):
+TOKEN="<jwt-rs256-do-idp>"
+
+# Handshake + tools/list: o principal vem do `sub` do token e a lista é filtrada (E3).
+SID=$(curl -sS -D - -o /dev/null -X POST "$URL" -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}' \
+  | awk -F': ' 'tolower($1)=="mcp-session-id"{gsub(/\r/,"",$2);print $2}')
+# token assinado por outra chave / kid desconhecido / iss|aud errados / expirado => 401
+# auditoria: "identity":"<sub-do-idp>"
+```
+
+> **Sem um IdP à mão?** A suíte automatizada já prova o caminho RS256/JWKS ponta a
+> ponta (chave de teste gerada no teste, JWKS servido por `httptest`, rotação de
+> `kid`, `iss`/`aud`/assinatura inválidos, e o endpoint RFC 9728):
+> `go test ./internal/auth/ -run 'OIDC|JWKS|Metadata' -v`.
+
+### Smoke B — Autorização delegada no sul (`auth.type: per_user`, E4-sul)
+
+Prova que **o usuário A só acessa a conta de A**, que **a ausência de credencial nega**
+(fail-closed) e que **o token do norte não vaza** ao upstream (no-passthrough). Usa um
+upstream HTTP `per_user` (ex.: o bloco `github` de [configs/mcpgate.example.yaml](configs/mcpgate.example.yaml))
+e o **vault cifrado**.
+
+```bash
+# 1. Gere a chave do vault (AES-256, base64) e enrole a credencial de cada usuário.
+export MCPGATE_CRED_KEY=$(head -c 32 /dev/urandom | base64)
+CFG=configs/mcpgate.example.yaml
+
+echo 'ghp_token_do_alice' | ./bin/mcpgate cred put --config $CFG --upstream github --principal alice
+echo 'ghp_token_do_bob'   | ./bin/mcpgate cred put --config $CFG --upstream github --principal bob
+./bin/mcpgate cred ls --config $CFG          # lista (upstream, principal) — SEM segredos
+cat secrets/creds.enc                        # cifrado em repouso: nada legível
+```
+
+Em runtime, quando **alice** chama uma tool do `github`, o gateway injeta a credencial
+de alice no leg sul; **bob** recebe a de bob; um principal **sem** credencial é **negado**
+com erro JSON-RPC limpo (`-32003`), e a auditoria registra `upstream_cred` (a referência,
+nunca o segredo). A prova ponta a ponta — incluindo o **assert de que o bearer do norte
+NÃO aparece na request ao upstream** (upstream HTTP real via `httptest`) — está
+automatizada:
+
+```bash
+go test ./internal/proxy/    -run 'SouthAuth|PerUser' -v   # injeção, no-passthrough, fail-closed, auditoria
+go test ./internal/credstore/ -v                            # vault cifrado em repouso, fail-closed, chave errada
+```
 
 ## Stack
 

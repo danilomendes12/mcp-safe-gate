@@ -1,0 +1,50 @@
+# Config para o smoke da AUTENTICAÇÃO norte com um IdP externo de verdade (E4,
+# mode=oidc): o bearer é um JWT RS256 emitido pelo IdP, validado pelo gateway via
+# JWKS. O principal sai da claim `sub` (ou `principal_claim`) e alimenta o RBAC, a
+# descoberta filtrada (E3) e a auditoria.
+#
+# Boot:  ./bin/mcpgate serve --config configs/mcpgate.oidc.yaml   (transport http é o default)
+# Troque issuer/audience/jwks_uri pelos do seu IdP (Auth0, Keycloak, Google,
+# Entra ID...). Com só o `issuer`, o jwks_uri é descoberto via
+# <issuer>/.well-known/openid-configuration.
+listen: ":8080"
+
+default_agent: "anonymous" # só vale no caminho stdio; em http sem token => 401
+
+upstreams:
+  - name: everything
+    transport: stdio
+    command: ["npx", "-y", "@modelcontextprotocol/server-everything"]
+
+auth:
+  mode: oidc
+  required_scopes: ["tools:call"]
+  # `resource` + issuer habilitam o Protected Resource Metadata (RFC 9728) em
+  # /.well-known/oauth-protected-resource, e o WWW-Authenticate aponta pra lá.
+  resource: "http://localhost:8080"
+  resource_metadata_url: "http://localhost:8080/.well-known/oauth-protected-resource"
+  oidc:
+    issuer: "https://YOUR-IDP.example"   # ex.: https://dev-xxxx.us.auth0.com/
+    # jwks_uri: "https://YOUR-IDP.example/.well-known/jwks.json" # opcional (discovery)
+    audience: "mcpgate"                  # casa com a `aud` do token
+    algorithms: ["RS256"]
+    principal_claim: "sub"
+
+# Política por principal: o `sub` do IdP é o principal. Ajuste para o subject real
+# que seu IdP emite (ex.: "auth0|abc123" ou um email).
+policy:
+  default: deny
+  agents:
+    "YOUR-USER-SUBJECT":
+      default: deny
+      allow_tools:
+        - everything.echo
+
+rate_limit:
+  rps: 5
+  burst: 20
+
+audit:
+  sink: "file"
+  format: "jsonl"
+  path: "mcpgate-audit.jsonl"

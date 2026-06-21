@@ -31,7 +31,7 @@ tasks:
     cmds:
       - go build -ldflags='-s -w' -o bin/mcpgate ./cmd/mcpgate
 
-  inspect:
+  inspect-stdio:
     desc: Abre o MCP Inspector apontando pro gateway (transporte stdio; sobe o gateway como subprocesso)
     # O Inspector tem um --config próprio; passamos o nosso via env MCPGATE_CONFIG
     # com o -e dele, senão ele rouba a flag e tenta parsear o YAML como JSON.

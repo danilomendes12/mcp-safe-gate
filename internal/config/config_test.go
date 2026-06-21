@@ -53,6 +53,23 @@ func TestValidateErrors(t *testing.T) {
 			c.Auth = Auth{Mode: AuthAPIKey, APIKeys: []APIKey{{Key: "k", Principal: "a"}, {Key: "k", Principal: "b"}}}
 		}, "duplicado"},
 		{"jwt sem secret", func(c *Config) { c.Auth.Mode = AuthJWT }, "auth.jwt.secret"},
+		{"oidc sem issuer/jwks", func(c *Config) { c.Auth = Auth{Mode: AuthOIDC} }, "auth.oidc"},
+		{"oidc alg não-RS256", func(c *Config) {
+			c.Auth = Auth{Mode: AuthOIDC, OIDC: OIDC{Issuer: "https://idp", Algorithms: []string{"ES256"}}}
+		}, "algorithms"},
+		{"south auth.type inválido", func(c *Config) { c.Upstreams[1].Auth = UpstreamAuth{Type: "magic"} }, "auth.type"},
+		{"south auth em stdio", func(c *Config) {
+			c.Upstreams[0].Auth = UpstreamAuth{Type: SouthAuthServiceBearer}
+		}, "auth sul só se aplica"},
+		{"oauth_cc sem token_url", func(c *Config) {
+			c.Upstreams[1].Auth = UpstreamAuth{Type: SouthAuthServiceOAuthCC, OAuth: UpstreamOAuthCC{ClientIDEnv: "ID", ClientSecretEnv: "SEC"}}
+		}, "token_url"},
+		{"per_user sem vault", func(c *Config) { c.Upstreams[1].Auth = UpstreamAuth{Type: SouthAuthPerUser} }, "credentials.store"},
+		{"per_user file sem path", func(c *Config) {
+			c.Upstreams[1].Auth = UpstreamAuth{Type: SouthAuthPerUser}
+			c.Credentials = Credentials{Store: CredStoreFile, File: CredentialsFile{KeyEnv: "K"}}
+		}, "credentials.file.path"},
+		{"credentials.store inválido", func(c *Config) { c.Credentials = Credentials{Store: "vault"} }, "credentials.store"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -71,10 +88,17 @@ func TestValidateErrors(t *testing.T) {
 
 func TestValidateAuthModesOK(t *testing.T) {
 	cases := []func(*Config){
-		func(c *Config) { c.Auth = Auth{} },                  // vazio => none
-		func(c *Config) { c.Auth = Auth{Mode: AuthNone} },    // none explícito
+		func(c *Config) { c.Auth = Auth{} },               // vazio => none
+		func(c *Config) { c.Auth = Auth{Mode: AuthNone} }, // none explícito
 		func(c *Config) { c.Auth = Auth{Mode: AuthAPIKey, APIKeys: []APIKey{{Key: "k", Principal: "ci"}}} },
 		func(c *Config) { c.Auth = Auth{Mode: AuthJWT, JWT: JWT{Secret: "s"}} },
+		func(c *Config) { c.Auth = Auth{Mode: AuthOIDC, OIDC: OIDC{Issuer: "https://idp"}} },                 // discovery
+		func(c *Config) { c.Auth = Auth{Mode: AuthOIDC, OIDC: OIDC{JWKSURI: "https://idp/jwks"}} },           // jwks explícito
+		func(c *Config) { c.Upstreams[1].Auth = UpstreamAuth{Type: SouthAuthServiceBearer, BearerEnv: "T"} }, // service_bearer
+		func(c *Config) { // per_user com vault de arquivo
+			c.Upstreams[1].Auth = UpstreamAuth{Type: SouthAuthPerUser}
+			c.Credentials = Credentials{Store: CredStoreFile, File: CredentialsFile{Path: "creds.enc", KeyEnv: "K"}}
+		},
 	}
 	for i, mutate := range cases {
 		c := validCfg()

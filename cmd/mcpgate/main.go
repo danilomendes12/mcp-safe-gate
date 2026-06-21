@@ -33,7 +33,7 @@ func newRootCmd() *cobra.Command {
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
-	root.AddCommand(newServeCmd(), newValidateConfigCmd())
+	root.AddCommand(newServeCmd(), newValidateConfigCmd(), newCredCmd())
 	return root
 }
 
@@ -95,7 +95,7 @@ func runServe(ctx context.Context, configPath, transport string) error {
 		return err
 	}
 
-	auditLog, err := audit.New(cfg.Audit)
+	auditLog, err := audit.New(cfg.Audit, transport == transportStdio)
 	if err != nil {
 		return err
 	}

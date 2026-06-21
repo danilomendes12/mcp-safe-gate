@@ -214,7 +214,7 @@ func TestRateLimitCleanError(t *testing.T) {
 
 func newAudit(t *testing.T, path string) *audit.Logger {
 	t.Helper()
-	l, err := audit.New(config.Audit{Sink: config.SinkFile, Path: path})
+	l, err := audit.New(config.Audit{Sink: config.SinkFile, Path: path}, false)
 	if err != nil {
 		t.Fatalf("audit: %v", err)
 	}

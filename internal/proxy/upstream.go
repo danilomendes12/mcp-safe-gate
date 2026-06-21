@@ -20,12 +20,13 @@ import (
 	"github.com/danilomendes/mcpgate/internal/audit"
 	"github.com/danilomendes/mcpgate/internal/auth"
 	"github.com/danilomendes/mcpgate/internal/config"
+	"github.com/danilomendes/mcpgate/internal/credstore"
 )
 
 // connectUpstream abre a sessão com um upstream, lista suas tools e registra
 // cada uma no servidor do gateway.
 func (p *Proxy) connectUpstream(ctx context.Context, up config.Upstream) error {
-	transport, err := buildTransport(up)
+	transport, err := p.buildTransport(up)
 	if err != nil {
 		return err
 	}
@@ -80,6 +81,11 @@ func (p *Proxy) forwardHandler(upstream, namespacedName, originalName string, se
 			Decision:  audit.DecisionAllow,
 			ArgKeys:   argKeys(req.Params.Arguments),
 		}
+		// Auditoria identity-aware do leg sul (E4-sul): registra QUAL credencial de
+		// usuário foi usada (a referência, nunca o segredo). Vazio p/ conta de serviço.
+		if cred, ok := credstore.FromContext(ctx); ok {
+			rec.UpstreamCred = cred.Ref
+		}
 
 		// Repasse verbatim dos argumentos: json.RawMessage serializa para si
 		// mesma, então não há round-trip lossy ao colocá-la em Arguments (any).
@@ -106,7 +112,7 @@ func (p *Proxy) forwardHandler(upstream, namespacedName, originalName string, se
 }
 
 // buildTransport monta o transporte do cliente para um upstream conforme o tipo.
-func buildTransport(up config.Upstream) (mcp.Transport, error) {
+func (p *Proxy) buildTransport(up config.Upstream) (mcp.Transport, error) {
 	switch up.Transport {
 	case config.TransportStdio:
 		// O SDK sobe o processo (exec.Command) e fala stdin/stdout com ele.
@@ -114,14 +120,16 @@ func buildTransport(up config.Upstream) (mcp.Transport, error) {
 		return &mcp.CommandTransport{Command: cmd}, nil
 	case config.TransportHTTP:
 		t := &mcp.StreamableClientTransport{Endpoint: up.URL}
-		// Auth sul (E4): se o upstream exige bearer, injetamos o segredo no leg
-		// sul via http.Client. O segredo fica só entre gateway e upstream — NUNCA
-		// chega ao agente (que fala apenas o leg norte).
-		if up.BearerToken != "" {
-			t.HTTPClient = &http.Client{Transport: bearerRoundTripper{
-				token: up.BearerToken,
-				next:  http.DefaultTransport,
-			}}
+		// Auth sul (E4 / E4-sul): conforme up.Auth, o http.Client injeta a
+		// credencial certa (conta de serviço estática/OAuth-CC ou, em per_user, a
+		// credencial DO PRINCIPAL resolvida pelo southAuthMiddleware). O segredo
+		// fica só entre gateway e upstream — NUNCA chega ao agente.
+		client, err := p.southHTTPClient(up)
+		if err != nil {
+			return nil, err
+		}
+		if client != nil {
+			t.HTTPClient = client
 		}
 		return t, nil
 	default:
